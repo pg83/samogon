@@ -44,6 +44,9 @@ Subcommands:
   serve       SFTP daemon streaming from S3-backed CAS
   get         local download of a single file — same Storage/
               Prefetcher/virtualFile chain as serve, no SFTP
+  get2        raw-read benchmark: grabs every piece of a file in
+              arbitrary order across N workers, no cache or disk —
+              isolates minio/network from the get pipeline
   bench       PutObject throughput test — N goroutines spam fixed-
               size chunks at the endpoint, reports ops/s + MiB/s
 
@@ -86,6 +89,10 @@ func main() {
 		case "get":
 			cfg, opts := parseGetArgs(rest)
 			runGet(cfg, opts)
+
+		case "get2":
+			cfg, opts := parseGet2Args(rest)
+			runGet2(cfg, opts)
 
 		case "bench":
 			cfg, opts := parseBenchArgs(rest)
