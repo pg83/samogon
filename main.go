@@ -3,7 +3,36 @@ package main
 import (
 	"fmt"
 	"os"
+	"syscall"
 )
+
+// maxHashersEnv is anacrolix's global cap on concurrent piece hashers
+// (client.go: `var maxActivePieceHashers = initIntFromEnv(...)`).
+// It's a package-level var initialized from the environment *once*,
+// before main() runs — PieceHashersPerTorrent won't cross this floor,
+// so on a 24-core box you see uploads=24 regardless of per-torrent
+// config. The only lever is env-before-exec.
+const (
+	maxHashersEnv  = "TORRENT_MAX_ACTIVE_PIECE_HASHERS"
+	maxHashersWant = "128"
+)
+
+func ensureHashersEnv() {
+	if os.Getenv(maxHashersEnv) != "" {
+		return
+	}
+
+	// Can't just os.Setenv here — by the time main() runs, anacrolix
+	// has already read the env and cached the value. Re-exec
+	// ourselves with the variable set so the child's package init
+	// sees it.
+	Throw(os.Setenv(maxHashersEnv, maxHashersWant))
+
+	exe := Throw2(os.Executable())
+	fmt.Fprintln(os.Stderr, clr(clrB, "samogon: re-exec with "+maxHashersEnv+"="+maxHashersWant))
+
+	Throw(syscall.Exec(exe, os.Args, os.Environ()))
+}
 
 const usage = `usage: samogon <subcommand> [flags]
 
@@ -33,6 +62,13 @@ func main() {
 	if sub == "-h" || sub == "--help" || sub == "help" {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(0)
+	}
+
+	// Only fetch needs anacrolix; serve is network-only on SFTP.
+	// Avoid the re-exec round trip for serve so a misconfigured env
+	// doesn't mask itself across restart loops.
+	if sub == "fetch" {
+		ensureHashersEnv()
 	}
 
 	exc := Try(func() {
