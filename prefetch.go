@@ -27,7 +27,8 @@ type Prefetcher struct {
 
 	sf    singleflight.Group
 	queue chan string
-	sem   chan struct{}
+
+	workers int
 
 	hits     atomic.Int64
 	misses   atomic.Int64
@@ -48,11 +49,11 @@ func newPrefetcher(cfg *Config, store *Storage, cache *LRU, concurrency int) *Pr
 	queueSize := concurrency * 4
 
 	p := &Prefetcher{
-		store: store,
-		cache: cache,
-		cfg:   cfg,
-		queue: make(chan string, queueSize),
-		sem:   make(chan struct{}, concurrency),
+		store:    store,
+		cache:    cache,
+		cfg:      cfg,
+		queue:    make(chan string, queueSize),
+		workers:  concurrency,
 	}
 
 	for i := 0; i < concurrency; i++ {
@@ -81,6 +82,15 @@ func (p *Prefetcher) worker() {
 // Get returns piece bytes, caching the result. Concurrent Gets for
 // the same piece collapse into one underlying GetObject via
 // singleflight.
+//
+// No semaphore guard here. Earlier revisions held p.sem inside the
+// singleflight function to cap concurrency, but that starved
+// foreground readers: workers constantly re-acquire sem slots as the
+// queue drains, and a foreground Get that happens to be leader
+// (because the hash was never queued) would wait indefinitely behind
+// them. The effective concurrency cap is now the worker count
+// (= --up-parallel) plus one slack slot for whichever foreground
+// happens to be fetching — slightly lax but strictly fair.
 func (p *Prefetcher) Get(hash string) []byte {
 	if data, ok := p.cache.Get(hash); ok {
 		p.hits.Add(1)
@@ -92,9 +102,6 @@ func (p *Prefetcher) Get(hash string) []byte {
 		if data, ok := p.cache.Get(hash); ok {
 			return data, nil
 		}
-
-		p.sem <- struct{}{}
-		defer func() { <-p.sem }()
 
 		p.inFlight.Add(1)
 		t0 := time.Now()
@@ -160,6 +167,6 @@ func (p *Prefetcher) Stats() string {
 		"hits=%d misses=%d pf-issued=%d pf-dropped=%d pf-already-hit=%d fetched=%d inflight=%d/%d queue=%d/%d avg-fetch=%.1fms",
 		p.hits.Load(), p.misses.Load(),
 		p.preIss.Load(), p.preDrop.Load(), p.preHit.Load(),
-		n, p.inFlight.Load(), cap(p.sem),
+		n, p.inFlight.Load(), p.workers,
 		len(p.queue), cap(p.queue), avgMs)
 }
