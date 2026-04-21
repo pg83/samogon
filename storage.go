@@ -50,7 +50,10 @@ func (s *Storage) Stat(key string) bool {
 }
 
 func (s *Storage) PutBytes(key string, data []byte) {
-	cmd := s.mc("cp", "--quiet", "-", key)
+	// `mc cp -` isn't a thing; minio-client dedicates `mc pipe` to
+	// stdin→S3 writes. Using cp with '-' produces the cryptic
+	// "Unable to prepare URL for copying" error.
+	cmd := s.mc("pipe", "--quiet", key)
 	cmd.Stdin = bytes.NewReader(data)
 
 	var e bytes.Buffer
@@ -59,7 +62,7 @@ func (s *Storage) PutBytes(key string, data []byte) {
 	cmd.Stderr = &e
 
 	if err := cmd.Run(); err != nil {
-		ThrowFmt("mc cp - %s: %v: %s", key, err, strings.TrimSpace(e.String()))
+		ThrowFmt("mc pipe %s: %v: %s", key, err, strings.TrimSpace(e.String()))
 	}
 }
 
