@@ -1,0 +1,123 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+)
+
+// Storage is the minio-client wrapper. One per process; anchors a mc
+// config dir under cwd because the ci user in prod has neither a
+// writable $HOME nor /tmp (see molot's history — same lesson learned
+// the hard way). MC_HOST_samogon is passed via env on every invocation
+// so we never write credentials to disk.
+type Storage struct {
+	cfg *Config
+	dir string
+}
+
+func newStorage(cfg *Config) *Storage {
+	dir := Throw2(os.MkdirTemp(".", "mc-samogon-"))
+
+	return &Storage{cfg: cfg, dir: dir}
+}
+
+func (s *Storage) Close() {
+	_ = os.RemoveAll(s.dir)
+}
+
+func (s *Storage) mc(args ...string) *exec.Cmd {
+	all := append([]string{"--config-dir", s.dir}, args...)
+	cmd := exec.Command("minio-client", all...)
+	cmd.Env = append(os.Environ(), "MC_HOST_samogon="+s.cfg.MCHost)
+
+	return cmd
+}
+
+// Stat returns true iff key exists. Any error (network, auth, missing)
+// becomes false — callers treat "not there" as "not uploaded yet" and
+// the real error surfaces on the next Put.
+func (s *Storage) Stat(key string) bool {
+	cmd := s.mc("stat", "--json", key)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+
+	return cmd.Run() == nil
+}
+
+func (s *Storage) PutBytes(key string, data []byte) {
+	cmd := s.mc("cp", "--quiet", "-", key)
+	cmd.Stdin = bytes.NewReader(data)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+
+	Throw(cmd.Run())
+}
+
+func (s *Storage) PutFile(key, path string) {
+	cmd := s.mc("cp", "--quiet", path, key)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+
+	Throw(cmd.Run())
+}
+
+func (s *Storage) Cat(key string) []byte {
+	cmd := s.mc("cat", key)
+
+	var out bytes.Buffer
+
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+
+	Throw(cmd.Run())
+
+	return out.Bytes()
+}
+
+// mcLsEntry is the subset of `mc ls --json` lines we care about.
+type mcLsEntry struct {
+	Status string `json:"status"`
+	Key    string `json:"key"`
+	Type   string `json:"type"`
+}
+
+// List returns the leaf names (last path component) under prefix. Non-
+// file entries are dropped.
+func (s *Storage) List(prefix string) []string {
+	cmd := s.mc("ls", "--json", prefix)
+
+	var out bytes.Buffer
+
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+
+	Throw(cmd.Run())
+
+	var names []string
+
+	for _, line := range strings.Split(strings.TrimRight(out.String(), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+
+		var e mcLsEntry
+
+		// Skip non-JSON or malformed lines — `mc ls` occasionally
+		// emits summary rows; the filter is fine here.
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			continue
+		}
+
+		if e.Status != "success" || e.Type == "folder" {
+			continue
+		}
+
+		names = append(names, e.Key)
+	}
+
+	return names
+}
