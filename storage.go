@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path"
 	"strings"
+	"time"
 )
 
 // Storage is the minio-client wrapper. One per process; anchors a mc
@@ -38,6 +40,107 @@ func (s *Storage) mc(args ...string) *exec.Cmd {
 	return cmd
 }
 
+// isTransientMCError decides whether a minio-client stderr dump looks
+// like a transient condition worth retrying (network hiccups, server
+// restarts, rate-limits) vs a steady-state failure (auth, missing
+// bucket, malformed request).
+func isTransientMCError(stderr string) bool {
+	needles := []string{
+		"no such host",
+		"connection refused",
+		"connection reset",
+		"connection timed out",
+		"i/o timeout",
+		"broken pipe",
+		"EOF",
+		"Unable to connect",
+		"temporarily unavailable",
+		"RequestTimeout",
+		"SlowDown",
+		"InternalError",
+		"ServiceUnavailable",
+		"503 Service Unavailable",
+		"502 Bad Gateway",
+		"504 Gateway Timeout",
+	}
+
+	for _, n := range needles {
+		if strings.Contains(stderr, n) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isNotFoundMCError matches the S3/MinIO "this thing doesn't exist"
+// family. Used by List callers to turn "no such bucket / no such key"
+// into an empty listing (legitimately the same thing as "empty") while
+// still propagating auth / network errors.
+func isNotFoundMCError(stderr string) bool {
+	needles := []string{
+		"specified bucket does not exist",
+		"specified key does not exist",
+		"Object does not exist",
+		"NoSuchBucket",
+		"NoSuchKey",
+	}
+
+	for _, n := range needles {
+		if strings.Contains(stderr, n) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// withRetry runs fn with exponential backoff on transient errors. On a
+// non-transient error it throws immediately (retrying an auth failure
+// just spams the log). On exhausted retries it throws with the last
+// stderr attached so the caller sees what kept failing.
+func (s *Storage) withRetry(label string, fn func() (string, error)) {
+	const maxAttempts = 6
+
+	backoff := 500 * time.Millisecond
+
+	var lastErr error
+	var lastStderr string
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		stderr, err := fn()
+
+		if err == nil {
+			return
+		}
+
+		lastErr = err
+		lastStderr = stderr
+
+		if !isTransientMCError(stderr) {
+			ThrowFmt("minio-client %s: %v: %s", label, err, stderr)
+		}
+
+		if attempt == maxAttempts-1 {
+			break
+		}
+
+		fmt.Fprintln(os.Stderr, clr(clrY, fmt.Sprintf(
+			"minio-client %s: transient error (%s); retry %d/%d in %v",
+			label, stderr, attempt+1, maxAttempts, backoff)))
+
+		time.Sleep(backoff)
+		backoff *= 2
+
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+	}
+
+	ThrowFmt("minio-client %s: gave up after %d attempts: %v: %s",
+		label, maxAttempts, lastErr, lastStderr)
+}
+
 // Stat returns true iff key exists. Any error (network, auth, missing)
 // becomes false — callers treat "not there" as "not uploaded yet" and
 // the real error surfaces on the next Put.
@@ -50,46 +153,53 @@ func (s *Storage) Stat(key string) bool {
 }
 
 func (s *Storage) PutBytes(key string, data []byte) {
-	// `mc cp -` isn't a thing; minio-client dedicates `mc pipe` to
-	// stdin→S3 writes. Using cp with '-' produces the cryptic
-	// "Unable to prepare URL for copying" error.
-	cmd := s.mc("pipe", "--quiet", key)
-	cmd.Stdin = bytes.NewReader(data)
+	s.withRetry("pipe "+key, func() (string, error) {
+		cmd := s.mc("pipe", "--quiet", key)
+		cmd.Stdin = bytes.NewReader(data)
 
-	var e bytes.Buffer
+		var e bytes.Buffer
 
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = &e
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = &e
 
-	if err := cmd.Run(); err != nil {
-		ThrowFmt("minio-client pipe %s: %v: %s", key, err, strings.TrimSpace(e.String()))
-	}
+		err := cmd.Run()
+
+		return strings.TrimSpace(e.String()), err
+	})
 }
 
 func (s *Storage) PutFile(key, path string) {
-	cmd := s.mc("cp", "--quiet", path, key)
+	s.withRetry("cp "+path+" "+key, func() (string, error) {
+		cmd := s.mc("cp", "--quiet", path, key)
 
-	var e bytes.Buffer
+		var e bytes.Buffer
 
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = &e
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = &e
 
-	if err := cmd.Run(); err != nil {
-		ThrowFmt("minio-client cp %s %s: %v: %s", path, key, err, strings.TrimSpace(e.String()))
-	}
+		err := cmd.Run()
+
+		return strings.TrimSpace(e.String()), err
+	})
 }
 
 func (s *Storage) Cat(key string) []byte {
-	cmd := s.mc("cat", key)
+	var out bytes.Buffer
 
-	var out, e bytes.Buffer
+	s.withRetry("cat "+key, func() (string, error) {
+		out.Reset()
 
-	cmd.Stdout = &out
-	cmd.Stderr = &e
+		cmd := s.mc("cat", key)
 
-	if err := cmd.Run(); err != nil {
-		ThrowFmt("minio-client cat %s: %v: %s", key, err, strings.TrimSpace(e.String()))
-	}
+		var e bytes.Buffer
+
+		cmd.Stdout = &out
+		cmd.Stderr = &e
+
+		err := cmd.Run()
+
+		return strings.TrimSpace(e.String()), err
+	})
 
 	return out.Bytes()
 }
@@ -102,17 +212,35 @@ type mcLsEntry struct {
 }
 
 // List returns the leaf names (last path component) under prefix. Non-
-// file entries are dropped.
+// file entries are dropped. A "bucket/key does not exist" error is
+// treated as an empty listing (same observable state) — auth and
+// network failures still propagate through withRetry.
 func (s *Storage) List(prefix string) []string {
-	cmd := s.mc("ls", "--json", prefix)
+	var out bytes.Buffer
 
-	var out, e bytes.Buffer
+	exc := Try(func() {
+		s.withRetry("ls "+prefix, func() (string, error) {
+			out.Reset()
 
-	cmd.Stdout = &out
-	cmd.Stderr = &e
+			cmd := s.mc("ls", "--json", prefix)
 
-	if err := cmd.Run(); err != nil {
-		ThrowFmt("minio-client ls %s: %v: %s", prefix, err, strings.TrimSpace(e.String()))
+			var e bytes.Buffer
+
+			cmd.Stdout = &out
+			cmd.Stderr = &e
+
+			err := cmd.Run()
+
+			return strings.TrimSpace(e.String()), err
+		})
+	})
+
+	if exc != nil {
+		if isNotFoundMCError(exc.Error()) {
+			return nil
+		}
+
+		exc.throw()
 	}
 
 	var names []string
