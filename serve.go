@@ -19,7 +19,17 @@ func runServe(cfg *Config) {
 	cache := newLRU(cfg.LRUSize)
 	meta := newMeta(cfg, store)
 
-	meta.Reload()
+	// Initial load is advisory — the bucket may not exist yet on a
+	// fresh deployment, or S3 may be transiently unreachable. Log
+	// and let metaReloader pick it up on the next tick; the daemon
+	// must not refuse to start just because S3 isn't ready.
+	exc := Try(func() {
+		meta.Reload()
+	})
+
+	exc.Catch(func(e *Exception) {
+		fmt.Fprintln(os.Stderr, clr(clrY, "serve: initial reload failed (continuing): "+e.Error()))
+	})
 
 	go metaReloader(cfg, meta)
 

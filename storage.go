@@ -51,29 +51,41 @@ func (s *Storage) Stat(key string) bool {
 func (s *Storage) PutBytes(key string, data []byte) {
 	cmd := s.mc("cp", "--quiet", "-", key)
 	cmd.Stdin = bytes.NewReader(data)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
 
-	Throw(cmd.Run())
+	var e bytes.Buffer
+
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = &e
+
+	if err := cmd.Run(); err != nil {
+		ThrowFmt("mc cp - %s: %v: %s", key, err, strings.TrimSpace(e.String()))
+	}
 }
 
 func (s *Storage) PutFile(key, path string) {
 	cmd := s.mc("cp", "--quiet", path, key)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
 
-	Throw(cmd.Run())
+	var e bytes.Buffer
+
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = &e
+
+	if err := cmd.Run(); err != nil {
+		ThrowFmt("mc cp %s %s: %v: %s", path, key, err, strings.TrimSpace(e.String()))
+	}
 }
 
 func (s *Storage) Cat(key string) []byte {
 	cmd := s.mc("cat", key)
 
-	var out bytes.Buffer
+	var out, e bytes.Buffer
 
 	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = &e
 
-	Throw(cmd.Run())
+	if err := cmd.Run(); err != nil {
+		ThrowFmt("mc cat %s: %v: %s", key, err, strings.TrimSpace(e.String()))
+	}
 
 	return out.Bytes()
 }
@@ -90,12 +102,14 @@ type mcLsEntry struct {
 func (s *Storage) List(prefix string) []string {
 	cmd := s.mc("ls", "--json", prefix)
 
-	var out bytes.Buffer
+	var out, e bytes.Buffer
 
 	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = &e
 
-	Throw(cmd.Run())
+	if err := cmd.Run(); err != nil {
+		ThrowFmt("mc ls %s: %v: %s", prefix, err, strings.TrimSpace(e.String()))
+	}
 
 	var names []string
 
