@@ -362,10 +362,10 @@ func reportProgress(t *torrent.Torrent, s *samogonStorage, done <-chan struct{})
 			prevBytes = got
 			prevT = now
 
-			logf(clrB, "%d/%d (%.1f%%) %.1f KiB/s peers=%d active=%d pending=%d seeders=%d uploads=%d/%d",
+			logf(clrB, "%d/%d (%.1f%%) %.1f KiB/s peers=%d active=%d pending=%d seeders=%d uploads=%d/%d puts=%d",
 				got, total, pct, rate/1024.0,
 				ts.TotalPeers, ts.ActivePeers, ts.PendingPeers, ts.ConnectedSeeders,
-				len(s.sem), cap(s.sem))
+				len(s.sem), cap(s.sem), s.store.Puts.Load())
 		}
 	}
 }

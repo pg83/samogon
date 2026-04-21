@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,6 +21,12 @@ import (
 type Storage struct {
 	cfg *Config
 	dir string
+
+	// Puts counts how many PutBytes calls we've considered
+	// successful. Compared against the number of objects actually
+	// in the bucket, this tells you whether mc is reporting
+	// success without uploading anything.
+	Puts atomic.Int64
 }
 
 func newStorage(cfg *Config) *Storage {
@@ -153,34 +160,42 @@ func (s *Storage) Stat(key string) bool {
 }
 
 func (s *Storage) PutBytes(key string, data []byte) {
+	// --quiet is dropped: it suppresses mc's own diagnostic output
+	// and historically made silent-success-no-upload easier to
+	// miss. We route mc stdout to io.Discard anyway, so all that
+	// leaks on success is a progress line we never read.
 	s.withRetry("pipe "+key, func() (string, error) {
-		cmd := s.mc("pipe", "--quiet", key)
+		cmd := s.mc("pipe", key)
 		cmd.Stdin = bytes.NewReader(data)
 
 		var e bytes.Buffer
 
-		cmd.Stdout = os.Stderr
+		cmd.Stdout = io.Discard
 		cmd.Stderr = &e
 
 		err := cmd.Run()
 
 		return strings.TrimSpace(e.String()), err
 	})
+
+	s.Puts.Add(1)
 }
 
 func (s *Storage) PutFile(key, path string) {
 	s.withRetry("cp "+path+" "+key, func() (string, error) {
-		cmd := s.mc("cp", "--quiet", path, key)
+		cmd := s.mc("cp", path, key)
 
 		var e bytes.Buffer
 
-		cmd.Stdout = os.Stderr
+		cmd.Stdout = io.Discard
 		cmd.Stderr = &e
 
 		err := cmd.Run()
 
 		return strings.TrimSpace(e.String()), err
 	})
+
+	s.Puts.Add(1)
 }
 
 func (s *Storage) Cat(key string) []byte {
