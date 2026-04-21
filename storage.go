@@ -62,7 +62,7 @@ func (s *Storage) PutBytes(key string, data []byte) {
 	cmd.Stderr = &e
 
 	if err := cmd.Run(); err != nil {
-		ThrowFmt("mc pipe %s: %v: %s", key, err, strings.TrimSpace(e.String()))
+		ThrowFmt("minio-client pipe %s: %v: %s", key, err, strings.TrimSpace(e.String()))
 	}
 }
 
@@ -75,7 +75,7 @@ func (s *Storage) PutFile(key, path string) {
 	cmd.Stderr = &e
 
 	if err := cmd.Run(); err != nil {
-		ThrowFmt("mc cp %s %s: %v: %s", path, key, err, strings.TrimSpace(e.String()))
+		ThrowFmt("minio-client cp %s %s: %v: %s", path, key, err, strings.TrimSpace(e.String()))
 	}
 }
 
@@ -88,7 +88,7 @@ func (s *Storage) Cat(key string) []byte {
 	cmd.Stderr = &e
 
 	if err := cmd.Run(); err != nil {
-		ThrowFmt("mc cat %s: %v: %s", key, err, strings.TrimSpace(e.String()))
+		ThrowFmt("minio-client cat %s: %v: %s", key, err, strings.TrimSpace(e.String()))
 	}
 
 	return out.Bytes()
@@ -112,7 +112,7 @@ func (s *Storage) List(prefix string) []string {
 	cmd.Stderr = &e
 
 	if err := cmd.Run(); err != nil {
-		ThrowFmt("mc ls %s: %v: %s", prefix, err, strings.TrimSpace(e.String()))
+		ThrowFmt("minio-client ls %s: %v: %s", prefix, err, strings.TrimSpace(e.String()))
 	}
 
 	var names []string
