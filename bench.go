@@ -174,9 +174,6 @@ func benchReporter(
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 
-	var prevOps int64
-	prevT := start
-
 	for {
 		select {
 		case <-done:
@@ -185,11 +182,11 @@ func benchReporter(
 		case now := <-tick.C:
 			curOps := ops.Load()
 
-			dt := now.Sub(prevT).Seconds()
+			elapsed := now.Sub(start).Seconds()
 			rate := 0.0
 
-			if dt > 0 {
-				rate = float64(curOps-prevOps) / dt
+			if elapsed > 0 {
+				rate = float64(curOps) / elapsed
 			}
 
 			mbps := rate * float64(chunkSize) / (1024 * 1024)
@@ -203,9 +200,6 @@ func benchReporter(
 			fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf(
 				"bench: ops=%d errs=%d  %.1f ops/s  %.2f MiB/s  %.1f ms avg-latency",
 				curOps, errs.Load(), rate, mbps, avgLatMs)))
-
-			prevOps = curOps
-			prevT = now
 		}
 	}
 }
