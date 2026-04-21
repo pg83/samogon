@@ -13,7 +13,6 @@ type Config struct {
 	S3Endpt   string
 	S3Bucket  string
 	S3Root    string
-	MCHost    string
 
 	Listen     string
 	User       string
@@ -23,6 +22,7 @@ type Config struct {
 	ReloadSecs int
 	LRUSize    int
 	UpSem      int
+	Region     string
 
 	DataDir string
 }
@@ -32,7 +32,8 @@ func loadCommon() *Config {
 		S3Root:     "torrents",
 		ReloadSecs: 30,
 		LRUSize:    1000,
-		UpSem:      16,
+		UpSem:      32,
+		Region:     "us-east-1",
 	}
 
 	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
@@ -69,7 +70,8 @@ func parseFetchArgs(args []string) *Config {
 	fs.StringVar(&c.S3Endpt, "endpoint", c.S3Endpt, "S3 endpoint URL (env S3_ENDPOINT)")
 	fs.StringVar(&c.S3Bucket, "bucket", c.S3Bucket, "S3 bucket (env S3_BUCKET)")
 	fs.StringVar(&c.S3Root, "s3-root", c.S3Root, "S3 key prefix (env SAMOGON_S3_ROOT)")
-	fs.IntVar(&c.UpSem, "up-parallel", c.UpSem, "max concurrent minio-client uploads")
+	fs.StringVar(&c.Region, "region", c.Region, "S3 region (MinIO ignores it)")
+	fs.IntVar(&c.UpSem, "up-parallel", c.UpSem, "max concurrent PutObject calls")
 	fs.StringVar(&c.DataDir, "data-dir", "", "anacrolix scratch dir (default: mkdtemp under cwd)")
 
 	Throw(fs.Parse(args))
@@ -94,6 +96,7 @@ func parseServeArgs(args []string) *Config {
 	fs.StringVar(&c.S3Endpt, "endpoint", c.S3Endpt, "S3 endpoint URL (env S3_ENDPOINT)")
 	fs.StringVar(&c.S3Bucket, "bucket", c.S3Bucket, "S3 bucket (env S3_BUCKET)")
 	fs.StringVar(&c.S3Root, "s3-root", c.S3Root, "S3 key prefix (env SAMOGON_S3_ROOT)")
+	fs.StringVar(&c.Region, "region", c.Region, "S3 region (MinIO ignores it)")
 	fs.StringVar(&c.Listen, "listen", ":2222", "SFTP listen address")
 	fs.StringVar(&c.User, "user", "", "SFTP username for password auth (empty = no password auth)")
 	fs.StringVar(&c.Pass, "pass", "", "SFTP password for password auth")
@@ -142,30 +145,28 @@ func validate(c *Config) {
 		ThrowFmt("S3_BUCKET / --bucket is required")
 	}
 
-	scheme, host, ok := strings.Cut(c.S3Endpt, "://")
-
-	if !ok {
+	if !strings.Contains(c.S3Endpt, "://") {
 		ThrowFmt("S3_ENDPOINT missing scheme (expected http://... or https://...): %q", c.S3Endpt)
 	}
-
-	c.MCHost = fmt.Sprintf("%s://%s:%s@%s", scheme, c.AWSKey, c.AWSSecret, host)
 }
 
 // S3 key helpers — single source of truth for both fetch and serve, so
-// the layout can't drift between the writer and the reader.
+// the layout can't drift between the writer and the reader. Keys are
+// rooted at the bucket (no alias prefix), since we talk to S3 directly
+// via the SDK rather than routing through minio-client aliases.
 
 func (c *Config) KeyTorrent(infohash string) string {
-	return fmt.Sprintf("samogon/%s/%s/torrents/%s", c.S3Bucket, c.S3Root, infohash)
+	return fmt.Sprintf("%s/torrents/%s", c.S3Root, infohash)
 }
 
 func (c *Config) KeyPiece(hash string) string {
-	return fmt.Sprintf("samogon/%s/%s/pieces/%s", c.S3Bucket, c.S3Root, hash)
+	return fmt.Sprintf("%s/pieces/%s", c.S3Root, hash)
 }
 
 func (c *Config) PrefixTorrents() string {
-	return fmt.Sprintf("samogon/%s/%s/torrents/", c.S3Bucket, c.S3Root)
+	return fmt.Sprintf("%s/torrents/", c.S3Root)
 }
 
 func (c *Config) PrefixPieces() string {
-	return fmt.Sprintf("samogon/%s/%s/pieces/", c.S3Bucket, c.S3Root)
+	return fmt.Sprintf("%s/pieces/", c.S3Root)
 }

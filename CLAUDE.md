@@ -17,18 +17,18 @@ fetch.go:
   base64 → metainfo → anacrolix.Client(storage=samogonStorage)
   PieceImpl.WriteAt → buffer in RAM
   PieceImpl.MarkComplete (hash already verified by anacrolix) →
-      minio-client cp - torrents/pieces/<hash>
-  on torrent.Complete → minio-client cp file torrents/torrents/<infohash>
+      s3.PutObject torrents/pieces/<hash>
+  on torrent.Complete → s3.PutObject torrents/torrents/<infohash>
 
 samogon serve --listen :2222 --user X --pass Y
        │
        ▼
 serve.go: ssh.Server + SFTP subsystem
-meta.go: LIST torrents/torrents/ → fetch each .torrent → parse → keep in RAM
-         reload every 30s
+meta.go: ListObjectsV2 torrents/torrents/ → GetObject each .torrent →
+         parse → keep in RAM; reload every 30s
 sftp.go: Handlers{Fileread,Filelist}
          Fileread ReadAt(off, len) → piece_index = off/piece_len →
-             cache.Get(hash) ?? minio-client cat torrents/pieces/<hash> → cache.Put
+             cache.Get(hash) ?? GetObject torrents/pieces/<hash> → cache.Put
 cache.go: LRU(1000) keyed by piece-hash
 ```
 
@@ -59,8 +59,7 @@ Inherits wholesale from `gorn/STYLE.md`:
 - `github.com/anacrolix/torrent` — BitTorrent client. We plug in a custom `storage.ClientImpl`; anacrolix handles peers/trackers/DHT/piece verification.
 - `github.com/pkg/sftp` — SFTP server handlers.
 - `golang.org/x/crypto/ssh` — SSH server (transport for SFTP).
-- `github.com/hashicorp/golang-lru/v2` — piece cache.
-- **MinIO I/O shells out to `minio-client`.** Same pattern as molot. Fork-per-operation is cheap compared to network latency, keeps the daemon's code tiny, lets mc handle auth/retry/multipart. MC config dir is anchored at cwd (`mkdtemp ./mc-samogon-*`) because the ci user has no writable `$HOME` or `/tmp` in our prod env — see molot's history for the same lesson.
+- **S3 via `aws-sdk-go-v2`.** Matches gorn. Earlier revisions shelled out to `minio-client` per piece — at 200-300ms of fork+exec+TCP overhead each, upload throughput capped at ~5-10 pieces/s regardless of anacrolix's hasher parallelism. The SDK keeps one long-lived HTTP client with connection pooling; PutObject calls happen in parallel over reused TCP connections and hit the rate the underlying minio can actually absorb.
 
 ## Env required at runtime
 
@@ -72,7 +71,7 @@ S3_BUCKET              bucket name
 SAMOGON_S3_ROOT        (default "torrents")
 ```
 
-CLI flags override env. S3_ENDPOINT parsed into scheme+host; `MC_HOST_samogon=<scheme>://<key>:<secret>@<host>` composed once in `validate()`.
+CLI flags override env. Credentials go straight into a `credentials.NewStaticCredentialsProvider`; `S3_ENDPOINT` is passed as `BaseEndpoint` to the S3 client with `UsePathStyle=true` (MinIO requires it).
 
 ## Invariants
 

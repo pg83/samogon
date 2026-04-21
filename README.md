@@ -30,18 +30,18 @@ EOF
 fetch: stdin .torrent → metainfo → anacrolix.Client(storage = custom)
        PieceImpl.WriteAt → buffer in RAM
        PieceImpl.MarkComplete (hash verified by anacrolix)
-           → minio-client cp - torrents/pieces/<piece-hash>
-       torrent.Complete → minio-client cp .torrent
+           → s3.PutObject torrents/pieces/<piece-hash>
+       torrent.Complete → s3.PutObject .torrent
            → torrents/torrents/<infohash>
 
 samogon serve --listen :2222 --user X --pass Y
        │
        ▼
 serve: ssh.Server + SFTP subsystem
-meta:  LIST torrents/torrents/ → fetch each .torrent → parse → keep in RAM
-       reload every 30s
+meta:  ListObjectsV2 torrents/torrents/ → GetObject each .torrent →
+       parse → keep in RAM; reload every 30s
 sftp:  virtual FS; Fileread.ReadAt(off, len) → piece_idx = off/piece_len
-           cache.Get(hash) ?? minio-client cat torrents/pieces/<hash>
+           cache.Get(hash) ?? GetObject torrents/pieces/<hash>
                            → cache.Put
 ```
 
@@ -70,8 +70,8 @@ S3_BUCKET         bucket name
 SAMOGON_S3_ROOT   default "torrents"
 ```
 
-CLI flags override env. `MC_HOST_samogon=<scheme>://<key>:<secret>@<host>`
-is composed once in `validate()`; no credentials hit disk.
+CLI flags override env. Credentials go into the SDK's static provider;
+no config file is written.
 
 ## Usage
 
@@ -117,8 +117,9 @@ cgo wrapper whose `cfree` collides with ix's tcmalloc).
 
 See [`STYLE.md`](STYLE.md). `throw.go` is a byte-for-byte copy of
 gorn's; error handling goes through `Throw`/`Try`. All `.go` files live
-at the repo root — no `internal/`, `cmd/`, `pkg/`. MinIO I/O shells out
-to `minio-client`.
+at the repo root — no `internal/`, `cmd/`, `pkg/`. S3 via
+`aws-sdk-go-v2` (same SDK as gorn), one long-lived client with
+connection pooling.
 
 ## What's not done
 

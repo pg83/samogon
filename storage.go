@@ -2,291 +2,184 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
-	"fmt"
+	"context"
+	"errors"
 	"io"
+	"net/http"
 	"os"
-	"os/exec"
 	"path"
-	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
-// Storage is the minio-client wrapper. One per process; anchors a mc
-// config dir under cwd because the ci user in prod has neither a
-// writable $HOME nor /tmp (see molot's history — same lesson learned
-// the hard way). MC_HOST_samogon is passed via env on every invocation
-// so we never write credentials to disk.
+// Storage is the S3 client. Uses aws-sdk-go-v2 directly — one
+// long-lived HTTP client with connection pooling. Earlier revisions
+// shelled out to `minio-client` per call; forking a process for every
+// 256 KiB piece upload caps throughput at a few hundred pieces/sec
+// regardless of parallelism. Using the SDK drops fork+exec overhead
+// and lets retries happen inside one TCP connection.
 type Storage struct {
 	cfg *Config
-	dir string
+	cli *s3.Client
 
-	// Puts counts how many PutBytes calls we've considered
+	// Puts counts how many PutObject calls we've considered
 	// successful. Compared against the number of objects actually
-	// in the bucket, this tells you whether mc is reporting
+	// in the bucket, this tells you whether the SDK is reporting
 	// success without uploading anything.
 	Puts atomic.Int64
 }
 
 func newStorage(cfg *Config) *Storage {
-	dir := Throw2(os.MkdirTemp(".", "mc-samogon-"))
-
-	return &Storage{cfg: cfg, dir: dir}
-}
-
-func (s *Storage) Close() {
-	_ = os.RemoveAll(s.dir)
-}
-
-func (s *Storage) mc(args ...string) *exec.Cmd {
-	all := append([]string{"--config-dir", s.dir}, args...)
-	cmd := exec.Command("minio-client", all...)
-	cmd.Env = append(os.Environ(), "MC_HOST_samogon="+s.cfg.MCHost)
-
-	return cmd
-}
-
-// isTransientMCError decides whether a minio-client stderr dump looks
-// like a transient condition worth retrying (network hiccups, server
-// restarts, rate-limits) vs a steady-state failure (auth, missing
-// bucket, malformed request).
-func isTransientMCError(stderr string) bool {
-	needles := []string{
-		"no such host",
-		"connection refused",
-		"connection reset",
-		"connection timed out",
-		"i/o timeout",
-		"broken pipe",
-		"EOF",
-		"Unable to connect",
-		"temporarily unavailable",
-		"RequestTimeout",
-		"SlowDown",
-		"InternalError",
-		"ServiceUnavailable",
-		"503 Service Unavailable",
-		"502 Bad Gateway",
-		"504 Gateway Timeout",
+	awsCfg := aws.Config{
+		Region:      cfg.Region,
+		Credentials: credentials.NewStaticCredentialsProvider(cfg.AWSKey, cfg.AWSSecret, ""),
+		HTTPClient: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        256,
+				MaxIdleConnsPerHost: 256,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 
-	for _, n := range needles {
-		if strings.Contains(stderr, n) {
+	cli := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(cfg.S3Endpt)
+		o.UsePathStyle = true
+		o.RetryMaxAttempts = 6
+	})
+
+	return &Storage{cfg: cfg, cli: cli}
+}
+
+// Close is a no-op; kept so callers can `defer store.Close()` the
+// same way they would for a resource that needs cleanup.
+func (s *Storage) Close() {}
+
+// isNotFound matches the S3 "no such bucket / no such key / 404"
+// family. Used by List callers to turn an empty/fresh prefix into an
+// empty listing rather than an error.
+func isNotFound(err error) bool {
+	var nsk *types.NoSuchKey
+	var nsb *types.NoSuchBucket
+	var notFound *types.NotFound
+	var apiErr smithy.APIError
+
+	if errors.As(err, &nsk) || errors.As(err, &nsb) || errors.As(err, &notFound) {
+		return true
+	}
+
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchBucket", "NoSuchKey", "NotFound", "404":
 			return true
 		}
 	}
 
 	return false
-}
-
-// isNotFoundMCError matches the S3/MinIO "this thing doesn't exist"
-// family. Used by List callers to turn "no such bucket / no such key"
-// into an empty listing (legitimately the same thing as "empty") while
-// still propagating auth / network errors.
-func isNotFoundMCError(stderr string) bool {
-	needles := []string{
-		"specified bucket does not exist",
-		"specified key does not exist",
-		"Object does not exist",
-		"NoSuchBucket",
-		"NoSuchKey",
-	}
-
-	for _, n := range needles {
-		if strings.Contains(stderr, n) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// withRetry runs fn with exponential backoff on transient errors. On a
-// non-transient error it throws immediately (retrying an auth failure
-// just spams the log). On exhausted retries it throws with the last
-// stderr attached so the caller sees what kept failing.
-func (s *Storage) withRetry(label string, fn func() (string, error)) {
-	const maxAttempts = 6
-
-	backoff := 500 * time.Millisecond
-
-	var lastErr error
-	var lastStderr string
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		stderr, err := fn()
-
-		if err == nil {
-			return
-		}
-
-		lastErr = err
-		lastStderr = stderr
-
-		if !isTransientMCError(stderr) {
-			ThrowFmt("minio-client %s: %v: %s", label, err, stderr)
-		}
-
-		if attempt == maxAttempts-1 {
-			break
-		}
-
-		fmt.Fprintln(os.Stderr, clr(clrY, fmt.Sprintf(
-			"minio-client %s: transient error (%s); retry %d/%d in %v",
-			label, stderr, attempt+1, maxAttempts, backoff)))
-
-		time.Sleep(backoff)
-		backoff *= 2
-
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
-	}
-
-	ThrowFmt("minio-client %s: gave up after %d attempts: %v: %s",
-		label, maxAttempts, lastErr, lastStderr)
 }
 
 // Stat returns true iff key exists. Any error (network, auth, missing)
 // becomes false — callers treat "not there" as "not uploaded yet" and
 // the real error surfaces on the next Put.
 func (s *Storage) Stat(key string) bool {
-	cmd := s.mc("stat", "--json", key)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	_, err := s.cli.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String(s.cfg.S3Bucket),
+		Key:    aws.String(key),
+	})
 
-	return cmd.Run() == nil
+	return err == nil
 }
 
 func (s *Storage) PutBytes(key string, data []byte) {
-	// --quiet is dropped: it suppresses mc's own diagnostic output
-	// and historically made silent-success-no-upload easier to
-	// miss. We route mc stdout to io.Discard anyway, so all that
-	// leaks on success is a progress line we never read.
-	s.withRetry("pipe "+key, func() (string, error) {
-		cmd := s.mc("pipe", key)
-		cmd.Stdin = bytes.NewReader(data)
-
-		var e bytes.Buffer
-
-		cmd.Stdout = io.Discard
-		cmd.Stderr = &e
-
-		err := cmd.Run()
-
-		return strings.TrimSpace(e.String()), err
+	_, err := s.cli.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket:        aws.String(s.cfg.S3Bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
 	})
+
+	if err != nil {
+		ThrowFmt("s3 PutObject %s: %v", key, err)
+	}
 
 	s.Puts.Add(1)
 }
 
-func (s *Storage) PutFile(key, path string) {
-	s.withRetry("cp "+path+" "+key, func() (string, error) {
-		cmd := s.mc("cp", path, key)
+func (s *Storage) PutFile(key, p string) {
+	f := Throw2(os.Open(p))
+	defer f.Close()
 
-		var e bytes.Buffer
+	info := Throw2(f.Stat())
 
-		cmd.Stdout = io.Discard
-		cmd.Stderr = &e
-
-		err := cmd.Run()
-
-		return strings.TrimSpace(e.String()), err
+	_, err := s.cli.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket:        aws.String(s.cfg.S3Bucket),
+		Key:           aws.String(key),
+		Body:          f,
+		ContentLength: aws.Int64(info.Size()),
 	})
+
+	if err != nil {
+		ThrowFmt("s3 PutObject %s (from %s): %v", key, p, err)
+	}
 
 	s.Puts.Add(1)
 }
 
 func (s *Storage) Cat(key string) []byte {
-	var out bytes.Buffer
-
-	s.withRetry("cat "+key, func() (string, error) {
-		out.Reset()
-
-		cmd := s.mc("cat", key)
-
-		var e bytes.Buffer
-
-		cmd.Stdout = &out
-		cmd.Stderr = &e
-
-		err := cmd.Run()
-
-		return strings.TrimSpace(e.String()), err
+	out, err := s.cli.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.cfg.S3Bucket),
+		Key:    aws.String(key),
 	})
 
-	return out.Bytes()
+	if err != nil {
+		ThrowFmt("s3 GetObject %s: %v", key, err)
+	}
+
+	defer out.Body.Close()
+
+	return Throw2(io.ReadAll(out.Body))
 }
 
-// mcLsEntry is the subset of `mc ls --json` lines we care about.
-type mcLsEntry struct {
-	Status string `json:"status"`
-	Key    string `json:"key"`
-	Type   string `json:"type"`
-}
-
-// List returns the leaf names (last path component) under prefix. Non-
-// file entries are dropped. A "bucket/key does not exist" error is
-// treated as an empty listing (same observable state) — auth and
-// network failures still propagate through withRetry.
+// List returns the full keys under prefix. A "no such bucket/key"
+// error is treated as an empty listing (same observable state as an
+// empty prefix) — auth and network failures still throw.
 func (s *Storage) List(prefix string) []string {
-	var out bytes.Buffer
-
-	exc := Try(func() {
-		s.withRetry("ls "+prefix, func() (string, error) {
-			out.Reset()
-
-			cmd := s.mc("ls", "--json", prefix)
-
-			var e bytes.Buffer
-
-			cmd.Stdout = &out
-			cmd.Stderr = &e
-
-			err := cmd.Run()
-
-			return strings.TrimSpace(e.String()), err
-		})
+	pager := s3.NewListObjectsV2Paginator(s.cli, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.cfg.S3Bucket),
+		Prefix: aws.String(prefix),
 	})
 
-	if exc != nil {
-		if isNotFoundMCError(exc.Error()) {
-			return nil
+	var keys []string
+
+	for pager.HasMorePages() {
+		page, err := pager.NextPage(context.Background())
+
+		if err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+
+			ThrowFmt("s3 ListObjectsV2 %s: %v", prefix, err)
 		}
 
-		exc.throw()
+		for _, obj := range page.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
 	}
 
-	var names []string
-
-	for _, line := range strings.Split(strings.TrimRight(out.String(), "\n"), "\n") {
-		if line == "" {
-			continue
-		}
-
-		var e mcLsEntry
-
-		// Skip non-JSON or malformed lines — `mc ls` occasionally
-		// emits summary rows; the filter is fine here.
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			continue
-		}
-
-		if e.Status != "success" || e.Type == "folder" {
-			continue
-		}
-
-		names = append(names, e.Key)
-	}
-
-	return names
+	return keys
 }
 
 // ListPieces returns a set of piece hashes (the leaf of each CAS key
 // under PrefixPieces). Called once at fetch start so anacrolix's
 // per-piece Completion() can check an in-memory map instead of
-// forking minio-client per piece.
+// hitting S3 for every piece.
 func (s *Storage) ListPieces(cfg *Config) map[string]bool {
 	keys := s.List(cfg.PrefixPieces())
 	out := make(map[string]bool, len(keys))
@@ -297,3 +190,4 @@ func (s *Storage) ListPieces(cfg *Config) map[string]bool {
 
 	return out
 }
+
