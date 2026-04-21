@@ -9,40 +9,72 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// Prefetcher sits in front of Storage.Cat for SFTP reads. Two jobs:
+// Prefetcher sits in front of Storage.Cat for SFTP reads. Three jobs:
 //
-//   - Dedupe concurrent fetches of the same piece. pkg/sftp fires
-//     many parallel ReadAt requests against one file; without
-//     singleflight, every one of them can race to GetObject on a cold
-//     cache entry.
-//   - Readahead. On each Get we async-fire fetches for the next K
-//     pieces of the same torrent so a sequential streamer (video
-//     playback, curl, sftp get) finds them already warm in the LRU.
-//     Cache hits cost ~0. Misses on the critical path block the
-//     reader — the whole point of this is to not block there.
+//   - Dedupe concurrent fetches of the same piece via singleflight.
+//   - Readahead into the LRU so sequential reads find pieces warm.
+//   - Bound memory/concurrency: a fixed pool of worker goroutines
+//     drains a bounded queue. Prefetch() enqueues hashes non-blocking;
+//     if the queue is full we drop — the foreground reader will
+//     fetch synchronously when it gets there. Earlier designs
+//     spawned a goroutine per prefetch request, which blew up
+//     spectacularly at K=5000 (millions of goroutines queued on a
+//     smaller sem, OOM-killed).
 type Prefetcher struct {
 	store *Storage
 	cache *LRU
 	cfg   *Config
 
-	sf  singleflight.Group
-	sem chan struct{}
+	sf    singleflight.Group
+	queue chan string
+	sem   chan struct{}
 
-	hits      atomic.Int64
-	misses    atomic.Int64
-	preIss    atomic.Int64
-	preHit    atomic.Int64
-	fetchN    atomic.Int64 // completed GetObject calls (unique, via singleflight)
-	fetchNs   atomic.Int64 // cumulative GetObject latency in ns
-	inFlight  atomic.Int64 // concurrent GetObject calls in progress
+	hits     atomic.Int64
+	misses   atomic.Int64
+	preIss   atomic.Int64 // handed to the queue
+	preDrop  atomic.Int64 // dropped because queue was full
+	preHit   atomic.Int64 // already-in-cache at enqueue time
+	fetchN   atomic.Int64 // completed GetObject calls (unique, via singleflight)
+	fetchNs  atomic.Int64 // cumulative GetObject latency in ns
+	inFlight atomic.Int64 // concurrent GetObject calls in progress
 }
 
 func newPrefetcher(cfg *Config, store *Storage, cache *LRU, concurrency int) *Prefetcher {
-	return &Prefetcher{
+	// Queue headroom: the workers drain as fast as GetObject will
+	// let them, so the queue mostly absorbs the burst created by a
+	// single getPiece() call (K items). A few multiples of
+	// concurrency is plenty — more just buffers stale prefetch
+	// targets that will be evicted by the time their turn comes.
+	queueSize := concurrency * 4
+
+	p := &Prefetcher{
 		store: store,
 		cache: cache,
 		cfg:   cfg,
+		queue: make(chan string, queueSize),
 		sem:   make(chan struct{}, concurrency),
+	}
+
+	for i := 0; i < concurrency; i++ {
+		go p.worker()
+	}
+
+	return p
+}
+
+func (p *Prefetcher) worker() {
+	for h := range p.queue {
+		if _, ok := p.cache.Get(h); ok {
+			continue
+		}
+
+		exc := Try(func() {
+			p.Get(h)
+		})
+
+		exc.Catch(func(e *Exception) {
+			fmt.Fprintln(os.Stderr, clr(clrY, "prefetch: "+h+": "+e.Error()))
+		})
 	}
 }
 
@@ -57,12 +89,12 @@ func (p *Prefetcher) Get(hash string) []byte {
 	}
 
 	v, _, _ := p.sf.Do(hash, func() (any, error) {
-		// Re-check the cache inside the flight — another caller may
-		// have finished a fetch and populated it while we were
-		// waiting for the lock.
 		if data, ok := p.cache.Get(hash); ok {
 			return data, nil
 		}
+
+		p.sem <- struct{}{}
+		defer func() { <-p.sem }()
 
 		p.inFlight.Add(1)
 		t0 := time.Now()
@@ -83,10 +115,10 @@ func (p *Prefetcher) Get(hash string) []byte {
 	return v.([]byte)
 }
 
-// Prefetch kicks off async fetches for hashes not yet in cache. If a
-// piece is already in-flight via singleflight, Do() collapses onto
-// the existing fetch and we just wait for it (cheap). The
-// concurrency bound keeps GetObject parallelism sane.
+// Prefetch enqueues hashes for asynchronous fetching. Non-blocking —
+// if the queue is full, the request is dropped (foreground Get will
+// fetch on demand when it arrives). Pieces already in cache are
+// skipped at enqueue time.
 func (p *Prefetcher) Prefetch(hashes []string) {
 	for _, h := range hashes {
 		if _, ok := p.cache.Get(h); ok {
@@ -95,25 +127,13 @@ func (p *Prefetcher) Prefetch(hashes []string) {
 			continue
 		}
 
-		p.preIss.Add(1)
-		h := h
+		select {
+		case p.queue <- h:
+			p.preIss.Add(1)
 
-		go func() {
-			p.sem <- struct{}{}
-			defer func() { <-p.sem }()
-
-			// Wrap in Try so a throw (S3 4xx, timeout) doesn't
-			// kill the daemon. A prefetch miss just means the
-			// caller's own Get will re-try synchronously and
-			// surface the real error then.
-			exc := Try(func() {
-				p.Get(h)
-			})
-
-			exc.Catch(func(e *Exception) {
-				fmt.Fprintln(os.Stderr, clr(clrY, "prefetch: "+h+": "+e.Error()))
-			})
-		}()
+		default:
+			p.preDrop.Add(1)
+		}
 	}
 }
 
@@ -126,8 +146,9 @@ func (p *Prefetcher) Stats() string {
 	}
 
 	return fmt.Sprintf(
-		"hits=%d misses=%d prefetch-issued=%d prefetch-hit=%d fetched=%d inflight=%d/%d avg-fetch=%.1fms",
+		"hits=%d misses=%d pf-issued=%d pf-dropped=%d pf-already-hit=%d fetched=%d inflight=%d/%d queue=%d/%d avg-fetch=%.1fms",
 		p.hits.Load(), p.misses.Load(),
-		p.preIss.Load(), p.preHit.Load(),
-		n, p.inFlight.Load(), cap(p.sem), avgMs)
+		p.preIss.Load(), p.preDrop.Load(), p.preHit.Load(),
+		n, p.inFlight.Load(), cap(p.sem),
+		len(p.queue), cap(p.queue), avgMs)
 }
