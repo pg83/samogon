@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -52,7 +53,7 @@ func parseGetArgs(args []string) (*Config, getOpts) {
 	opts.target = fs.Arg(0)
 
 	if opts.outPath == "" {
-		opts.outPath = path.Base(opts.target)
+		opts.outPath = path.Base(strings.TrimRight(opts.target, "/"))
 	}
 
 	if opts.chunk <= 0 {
@@ -78,8 +79,8 @@ func runGet(cfg *Config, opts getOpts) {
 
 	tname, fpath := splitPath("/" + opts.target)
 
-	if tname == "" || fpath == "" {
-		ThrowFmt("get: target must be <torrent>/<file>, got %q", opts.target)
+	if tname == "" {
+		ThrowFmt("get: target must start with <torrent-name>, got %q", opts.target)
 	}
 
 	tm, ok := meta.ByName(tname)
@@ -90,16 +91,34 @@ func runGet(cfg *Config, opts getOpts) {
 
 	var file *FileEntry
 
-	for i := range tm.Files {
-		if tm.Files[i].Path == fpath {
-			file = &tm.Files[i]
+	if fpath == "" {
+		// Bare torrent name. For a single-file torrent (ISO etc.)
+		// pick the only file; for multi-file, reject and list what's
+		// available so the caller can pick.
+		if len(tm.Files) == 1 {
+			file = &tm.Files[0]
+		} else {
+			paths := make([]string, len(tm.Files))
 
-			break
+			for i := range tm.Files {
+				paths[i] = tm.Files[i].Path
+			}
+
+			ThrowFmt("get: torrent %q has %d files; specify one as %s/<path>; available: %v",
+				tname, len(tm.Files), tname, paths)
 		}
-	}
+	} else {
+		for i := range tm.Files {
+			if tm.Files[i].Path == fpath {
+				file = &tm.Files[i]
 
-	if file == nil {
-		ThrowFmt("get: no such file in torrent %q: %s", tname, fpath)
+				break
+			}
+		}
+
+		if file == nil {
+			ThrowFmt("get: no such file in torrent %q: %s", tname, fpath)
+		}
 	}
 
 	vf := &virtualFile{
