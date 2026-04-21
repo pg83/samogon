@@ -9,88 +9,113 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// Prefetcher sits in front of Storage.Cat for SFTP reads. Three jobs:
+// Prefetcher runs background GetObjects into the LRU, following
+// ranges the reader submits. Design points:
 //
-//   - Dedupe concurrent fetches of the same piece via singleflight.
-//   - Readahead into the LRU so sequential reads find pieces warm.
-//   - Bound memory/concurrency: a fixed pool of worker goroutines
-//     drains a bounded queue. Prefetch() enqueues hashes non-blocking;
-//     if the queue is full we drop — the foreground reader will
-//     fetch synchronously when it gets there. Earlier designs
-//     spawned a goroutine per prefetch request, which blew up
-//     spectacularly at K=5000 (millions of goroutines queued on a
-//     smaller sem, OOM-killed).
+//   - Submit() is blocking. Natural backpressure: if workers can't
+//     keep up, the reader stalls at submit instead of racing ahead
+//     and filling memory with pending work.
+//   - Queue items are ranges (slices of piece hashes), not individual
+//     hashes. One channel send per reader step regardless of K —
+//     matters when --prefetch-k is in the thousands.
+//   - One worker processes one range at a time, sequentially through
+//     its pieces. Concurrency comes from N workers (= --up-parallel)
+//     pulling different ranges in parallel.
+//   - Each worker maintains a local set of hashes it has already
+//     fetched in the current epoch (= last 100 ranges). Prevents
+//     re-entering the LRU mutex + singleflight machinery when
+//     consecutive reader windows overlap. The set is reset
+//     periodically so memory stays bounded and stale entries don't
+//     accumulate.
+//   - Singleflight dedupes across workers: two workers reaching the
+//     same hash (different ranges, not caught by local sets) collapse
+//     onto one GetObject.
 type Prefetcher struct {
 	store *Storage
 	cache *LRU
 	cfg   *Config
 
-	sf    singleflight.Group
-	queue chan string
+	sf     singleflight.Group
+	ranges chan []string
 
 	workers int
 
-	hits     atomic.Int64
-	misses   atomic.Int64
-	preIss   atomic.Int64 // handed to the queue
-	preDrop  atomic.Int64 // dropped because queue was full
-	preHit   atomic.Int64 // already-in-cache at enqueue time
-	fetchN   atomic.Int64 // completed GetObject calls (unique, via singleflight)
-	fetchNs  atomic.Int64 // cumulative GetObject latency in ns
-	inFlight atomic.Int64 // concurrent GetObject calls in progress
+	hits         atomic.Int64
+	misses       atomic.Int64
+	submitted    atomic.Int64 // ranges successfully enqueued
+	skippedLocal atomic.Int64 // hashes skipped by worker-local epoch set
+	fetchN       atomic.Int64 // unique GetObject calls (via singleflight)
+	fetchNs      atomic.Int64 // cumulative GetObject latency
+	inFlight     atomic.Int64 // concurrent GetObject calls
 }
 
-func newPrefetcher(cfg *Config, store *Storage, cache *LRU, concurrency int) *Prefetcher {
-	// Queue headroom: the workers drain as fast as GetObject will
-	// let them, so the queue mostly absorbs the burst created by a
-	// single getPiece() call (K items). A few multiples of
-	// concurrency is plenty — more just buffers stale prefetch
-	// targets that will be evicted by the time their turn comes.
-	queueSize := concurrency * 4
+// workerEpoch is how many ranges a worker processes before wiping its
+// local "already-done" set. 100 is a round number; big enough that
+// typical overlapping windows stay deduplicated, small enough that
+// the set doesn't grow without bound.
+const workerEpoch = 100
 
+func newPrefetcher(cfg *Config, store *Storage, cache *LRU, workers int) *Prefetcher {
 	p := &Prefetcher{
-		store:    store,
-		cache:    cache,
-		cfg:      cfg,
-		queue:    make(chan string, queueSize),
-		workers:  concurrency,
+		store:   store,
+		cache:   cache,
+		cfg:     cfg,
+		ranges:  make(chan []string, workers*2),
+		workers: workers,
 	}
 
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < workers; i++ {
 		go p.worker()
 	}
 
 	return p
 }
 
+// Submit enqueues a range of piece hashes for asynchronous fetching.
+// Blocks if the queue is full — that backpressure keeps readers from
+// outrunning the fetcher.
+func (p *Prefetcher) Submit(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+
+	p.ranges <- hashes
+	p.submitted.Add(1)
+}
+
 func (p *Prefetcher) worker() {
-	for h := range p.queue {
-		if _, ok := p.cache.Get(h); ok {
-			continue
+	seen := make(map[string]struct{})
+	processed := 0
+
+	for r := range p.ranges {
+		for _, h := range r {
+			if _, ok := seen[h]; ok {
+				p.skippedLocal.Add(1)
+
+				continue
+			}
+
+			seen[h] = struct{}{}
+
+			exc := Try(func() {
+				p.fetch(h)
+			})
+
+			exc.Catch(func(e *Exception) {
+				fmt.Fprintln(os.Stderr, clr(clrY, "prefetch: "+h+": "+e.Error()))
+			})
 		}
 
-		exc := Try(func() {
-			p.Get(h)
-		})
+		processed++
 
-		exc.Catch(func(e *Exception) {
-			fmt.Fprintln(os.Stderr, clr(clrY, "prefetch: "+h+": "+e.Error()))
-		})
+		if processed >= workerEpoch {
+			seen = make(map[string]struct{})
+			processed = 0
+		}
 	}
 }
 
-// Get returns piece bytes, caching the result. Concurrent Gets for
-// the same piece collapse into one underlying GetObject via
-// singleflight.
-//
-// No semaphore guard here. Earlier revisions held p.sem inside the
-// singleflight function to cap concurrency, but that starved
-// foreground readers: workers constantly re-acquire sem slots as the
-// queue drains, and a foreground Get that happens to be leader
-// (because the hash was never queued) would wait indefinitely behind
-// them. The effective concurrency cap is now the worker count
-// (= --up-parallel) plus one slack slot for whichever foreground
-// happens to be fetching — slightly lax but strictly fair.
+// Get is the foreground read path — immediate, no ranges.
 func (p *Prefetcher) Get(hash string) []byte {
 	if data, ok := p.cache.Get(hash); ok {
 		p.hits.Add(1)
@@ -98,6 +123,15 @@ func (p *Prefetcher) Get(hash string) []byte {
 		return data
 	}
 
+	p.misses.Add(1)
+
+	return p.fetch(hash)
+}
+
+// fetch runs through singleflight so concurrent requests for the
+// same hash — foreground racing a prefetch, or two overlapping
+// worker ranges — share one underlying GetObject.
+func (p *Prefetcher) fetch(hash string) []byte {
 	v, _, _ := p.sf.Do(hash, func() (any, error) {
 		if data, ok := p.cache.Get(hash); ok {
 			return data, nil
@@ -117,42 +151,7 @@ func (p *Prefetcher) Get(hash string) []byte {
 		return data, nil
 	})
 
-	p.misses.Add(1)
-
 	return v.([]byte)
-}
-
-// Prefetch enqueues hashes for asynchronous fetching. Non-blocking —
-// if the queue is full we stop iterating (the remaining hashes, all
-// farther from the reader, would just get dropped anyway). Pieces
-// already in cache are skipped at enqueue time.
-//
-// The early exit matters a lot at large K. On each getPiece we get
-// called with K hashes; iterating to 5000 takes 5000 cache.Get calls
-// against the LRU mutex, and with workers + foreground all
-// contending, that alone becomes the bottleneck long before the
-// extra prefetches could ever land usefully.
-func (p *Prefetcher) Prefetch(hashes []string) {
-	for i, h := range hashes {
-		if _, ok := p.cache.Get(h); ok {
-			p.preHit.Add(1)
-
-			continue
-		}
-
-		select {
-		case p.queue <- h:
-			p.preIss.Add(1)
-
-		default:
-			// Account for everything we didn't even try — gives
-			// a truthful ratio of "asked vs delivered to
-			// workers" when K is oversized.
-			p.preDrop.Add(int64(len(hashes) - i))
-
-			return
-		}
-	}
 }
 
 func (p *Prefetcher) Stats() string {
@@ -164,9 +163,9 @@ func (p *Prefetcher) Stats() string {
 	}
 
 	return fmt.Sprintf(
-		"hits=%d misses=%d pf-issued=%d pf-dropped=%d pf-already-hit=%d fetched=%d inflight=%d/%d queue=%d/%d avg-fetch=%.1fms",
+		"hits=%d misses=%d ranges=%d local-skip=%d fetched=%d inflight=%d/%d queue=%d/%d avg-fetch=%.1fms",
 		p.hits.Load(), p.misses.Load(),
-		p.preIss.Load(), p.preDrop.Load(), p.preHit.Load(),
+		p.submitted.Load(), p.skippedLocal.Load(),
 		n, p.inFlight.Load(), p.workers,
-		len(p.queue), cap(p.queue), avgMs)
+		len(p.ranges), cap(p.ranges), avgMs)
 }

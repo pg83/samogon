@@ -288,26 +288,22 @@ func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (v *virtualFile) getPiece(idx int) []byte {
-	// Warm up the next K pieces in the background before blocking on
-	// the current one — the prefetch goroutines run in parallel with
-	// the foreground Get via the singleflight pool. K is configurable
-	// (--prefetch-k); 0 disables readahead entirely.
+	// Submit a [idx+1, idx+1+K) range to the prefetcher on every
+	// step; Submit blocks if the queue is full, which is the
+	// backpressure we want. K is configurable (--prefetch-k).
 	k := v.pref.cfg.PrefetchK
 
 	if k > 0 {
-		ahead := make([]string, 0, k)
+		start := idx + 1
+		end := start + k
 
-		for i := 1; i <= k; i++ {
-			nxt := idx + i
-
-			if nxt >= len(v.tm.PieceHashes) {
-				break
-			}
-
-			ahead = append(ahead, v.tm.PieceHashes[nxt])
+		if end > len(v.tm.PieceHashes) {
+			end = len(v.tm.PieceHashes)
 		}
 
-		v.pref.Prefetch(ahead)
+		if start < end {
+			v.pref.Submit(v.tm.PieceHashes[start:end])
+		}
 	}
 
 	return v.pref.Get(v.tm.PieceHashes[idx])
