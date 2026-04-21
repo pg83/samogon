@@ -24,8 +24,7 @@ type Config struct {
 	LRUSize    int
 	UpSem      int
 
-	TorrentB64 string
-	DataDir    string
+	DataDir string
 }
 
 func loadCommon() *Config {
@@ -75,11 +74,9 @@ func parseFetchArgs(args []string) *Config {
 
 	Throw(fs.Parse(args))
 
-	if fs.NArg() != 1 {
-		ThrowFmt("samogon fetch: expected exactly one positional argument (base64 of .torrent), got %d", fs.NArg())
+	if fs.NArg() > 0 {
+		ThrowFmt("samogon fetch: unexpected positional args: %v (.torrent comes on stdin)", fs.Args())
 	}
-
-	c.TorrentB64 = fs.Arg(0)
 
 	validate(c)
 

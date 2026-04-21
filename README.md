@@ -3,10 +3,10 @@
 Torrent→S3 bridge with an SFTP read-out. Two subcommands share one
 binary:
 
-- `samogon fetch <base64>` — one-shot. Decodes a `.torrent`, joins the
-  swarm via [anacrolix/torrent], and pushes each piece into MinIO as a
-  content-addressable blob keyed by piece hash. The `.torrent` itself
-  is uploaded last as a commit marker.
+- `samogon fetch` — one-shot. Reads `.torrent` bytes from stdin, joins
+  the swarm via [anacrolix/torrent], and pushes each piece into MinIO
+  as a content-addressable blob keyed by piece hash. The `.torrent`
+  itself is uploaded last as a commit marker.
 - `samogon serve` — long-lived SFTP daemon. Loads every `.torrent`
   under the root into memory, exposes each torrent as a virtual
   directory, and serves bytes on demand by fetching pieces from CAS
@@ -21,10 +21,13 @@ Seeding is **not** implemented.
 ## Architecture
 
 ```
-gorn ignite -- samogon fetch <b64>
+gorn ignite <<EOF                          # script piped to ignite
+#!/bin/sh
+echo 'BASE64...' | base64 -d | samogon fetch
+EOF
        │
        ▼
-fetch: base64 → metainfo → anacrolix.Client(storage = custom)
+fetch: stdin .torrent → metainfo → anacrolix.Client(storage = custom)
        PieceImpl.WriteAt → buffer in RAM
        PieceImpl.MarkComplete (hash verified by anacrolix)
            → minio-client cp - torrents/pieces/<piece-hash>
@@ -74,7 +77,7 @@ is composed once in `validate()`; no credentials hit disk.
 
 ```sh
 # one-shot: join the swarm, push to CAS, commit the .torrent
-samogon fetch "$(base64 < ubuntu-24.04.iso.torrent)"
+samogon fetch < ubuntu-24.04.iso.torrent
 
 # daemon: SFTP read-out
 samogon serve \

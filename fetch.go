@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -202,7 +201,17 @@ func runCatch(fn func()) error {
 }
 
 func runFetch(cfg *Config) {
-	raw := Throw2(base64.StdEncoding.DecodeString(cfg.TorrentB64))
+	// .torrent is read from stdin rather than argv — real torrents
+	// routinely exceed ARG_MAX as base64 (ubuntu-25.10 desktop.iso
+	// torrent is ~400KiB, well past the 128KiB default). Callers
+	// pipe raw bytes in; gorn integration is a shell one-liner that
+	// base64-decodes into the pipe from within the task script.
+	raw := Throw2(io.ReadAll(os.Stdin))
+
+	if len(raw) == 0 {
+		ThrowFmt("fetch: empty stdin — pipe .torrent bytes in")
+	}
+
 	mi := Throw2(metainfo.Load(bytes.NewReader(raw)))
 	infohash := mi.HashInfoBytes().HexString()
 

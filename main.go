@@ -8,10 +8,11 @@ import (
 const usage = `usage: samogon <subcommand> [flags]
 
 Subcommands:
-  fetch <base64>    one-shot torrent downloader; writes pieces to
-                    S3 as torrents/pieces/<hash> and the .torrent
-                    itself as torrents/torrents/<infohash>
-  serve             SFTP daemon streaming from S3-backed CAS
+  fetch       one-shot torrent downloader; reads .torrent bytes
+              from stdin, writes pieces to S3 as
+              torrents/pieces/<hash> and the .torrent itself as
+              torrents/torrents/<infohash>
+  serve       SFTP daemon streaming from S3-backed CAS
 
 Env (shared):
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
