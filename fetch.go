@@ -11,6 +11,7 @@ import (
 	"time"
 
 	g "github.com/anacrolix/generics"
+	alog "github.com/anacrolix/log"
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
@@ -200,26 +201,39 @@ func runCatch(fn func()) error {
 	return exc.Unwrap()
 }
 
+func logf(color, format string, args ...any) {
+	fmt.Fprintln(os.Stderr, clr(color, "fetch: "+fmt.Sprintf(format, args...)))
+}
+
 func runFetch(cfg *Config) {
 	// .torrent is read from stdin rather than argv — real torrents
 	// routinely exceed ARG_MAX as base64 (ubuntu-25.10 desktop.iso
 	// torrent is ~400KiB, well past the 128KiB default). Callers
 	// pipe raw bytes in; gorn integration is a shell one-liner that
 	// base64-decodes into the pipe from within the task script.
+	logf(clrB, "reading .torrent from stdin")
 	raw := Throw2(io.ReadAll(os.Stdin))
 
 	if len(raw) == 0 {
 		ThrowFmt("fetch: empty stdin — pipe .torrent bytes in")
 	}
 
+	logf(clrB, "got %d bytes, parsing", len(raw))
+
 	mi := Throw2(metainfo.Load(bytes.NewReader(raw)))
+	info := Throw2(mi.UnmarshalInfo())
 	infohash := mi.HashInfoBytes().HexString()
+
+	logf(clrB, "infohash=%s name=%q pieces=%d total=%d bytes",
+		infohash, info.Name, info.NumPieces(), info.TotalLength())
 
 	store := newStorage(cfg)
 	defer store.Close()
 
+	logf(clrB, "checking S3 for commit marker %s", cfg.KeyTorrent(infohash))
+
 	if store.Stat(cfg.KeyTorrent(infohash)) {
-		fmt.Fprintln(os.Stderr, clr(clrG, "fetch: already-done "+infohash))
+		logf(clrG, "already-done %s", infohash)
 
 		return
 	}
@@ -227,16 +241,27 @@ func runFetch(cfg *Config) {
 	scratch := Throw2(os.MkdirTemp(".", "samogon-fetch-"))
 	defer os.RemoveAll(scratch)
 
+	logf(clrB, "scratch dir %s", scratch)
+
 	tcfg := torrent.NewDefaultClientConfig()
 	tcfg.DefaultStorage = newSamogonStorage(cfg, store)
 	tcfg.DataDir = scratch
 	tcfg.Seed = false
+	// Lower the anacrolix filter so tracker/DHT/peer events surface
+	// on stderr instead of being swallowed by the default Warning
+	// floor — nothing more infuriating than "fetch is sitting there".
+	tcfg.Logger = alog.Default.FilterLevel(alog.Info)
 
+	logf(clrB, "starting anacrolix client")
 	client := Throw2(torrent.NewClient(tcfg))
 	defer client.Close()
 
+	logf(clrB, "listen: %v", client.ListenAddrs())
+
 	t := Throw2(client.AddTorrent(mi))
+	logf(clrB, "torrent added, waiting for Info")
 	<-t.GotInfo()
+	logf(clrB, "Info ready, starting download")
 	t.DownloadAll()
 
 	done := make(chan struct{})
@@ -254,23 +279,29 @@ func runFetch(cfg *Config) {
 	// .torrent upload is the "commit" — do it last, after every
 	// piece is in CAS. A crash before this point leaves orphan
 	// pieces in CAS (harmless; next run resumes via Completion()).
+	logf(clrB, "uploading commit marker")
 	store.PutBytes(cfg.KeyTorrent(infohash), raw)
 
-	fmt.Fprintln(os.Stderr, clr(clrG, "fetch: done "+infohash))
+	logf(clrG, "done %s", infohash)
 }
 
 func reportProgress(t *torrent.Torrent, done <-chan struct{}) {
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
+
+	var prevBytes int64
+
+	prevT := time.Now()
 
 	for {
 		select {
 		case <-done:
 			return
 
-		case <-tick.C:
+		case now := <-tick.C:
 			total := t.Length()
 			got := t.BytesCompleted()
+			st := t.Stats()
 
 			pct := 0.0
 
@@ -278,7 +309,19 @@ func reportProgress(t *torrent.Torrent, done <-chan struct{}) {
 				pct = 100.0 * float64(got) / float64(total)
 			}
 
-			fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("fetch: %d/%d (%.1f%%)", got, total, pct)))
+			dt := now.Sub(prevT).Seconds()
+			rate := 0.0
+
+			if dt > 0 {
+				rate = float64(got-prevBytes) / dt
+			}
+
+			prevBytes = got
+			prevT = now
+
+			logf(clrB, "%d/%d (%.1f%%) %.1f KiB/s peers=%d active=%d pending=%d seeders=%d",
+				got, total, pct, rate/1024.0,
+				st.TotalPeers, st.ActivePeers, st.PendingPeers, st.ConnectedSeeders)
 		}
 	}
 }
