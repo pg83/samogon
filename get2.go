@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ import (
 type get2Opts struct {
 	target   string
 	parallel int
+	shuffle  bool
 }
 
 func parseGet2Args(args []string) (*Config, get2Opts) {
@@ -47,6 +49,7 @@ func parseGet2Args(args []string) (*Config, get2Opts) {
 	opts := get2Opts{}
 
 	fs.IntVar(&opts.parallel, "parallel", 64, "number of worker goroutines")
+	fs.BoolVar(&opts.shuffle, "shuffle", true, "shuffle piece order before fetching (defeats minio/OS page cache)")
 
 	Throw(fs.Parse(args))
 
@@ -79,9 +82,15 @@ func runGet2(cfg *Config, opts get2Opts) {
 
 	hashes := resolveHashes(cfg, meta, opts.target)
 
+	if opts.shuffle {
+		rand.Shuffle(len(hashes), func(i, j int) {
+			hashes[i], hashes[j] = hashes[j], hashes[i]
+		})
+	}
+
 	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf(
-		"get2: %s → %d pieces, parallel=%d, endpoint=%s",
-		opts.target, len(hashes), opts.parallel, cfg.S3Endpt)))
+		"get2: %s → %d pieces, parallel=%d, shuffle=%v, endpoint=%s",
+		opts.target, len(hashes), opts.parallel, opts.shuffle, cfg.S3Endpt)))
 
 	queue := make(chan string, len(hashes))
 
