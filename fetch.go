@@ -31,15 +31,48 @@ type samogonStorage struct {
 	// per piece — 21k+ serial HEADs took anacrolix's AddTorrent off
 	// the cliff before any download started.
 	known map[string]bool
+	// states holds per-piece-index buffers + completion flags.
+	// PieceWithHash is called fresh on every anacrolix read/write
+	// access (piece.go:88), so PieceImpl must not carry state of
+	// its own — writes via one façade would land on a buffer a
+	// read via the next façade can't see. All mutable state lives
+	// here, keyed by piece index, and samogonPiece is just a thin
+	// facade over the shared state.
+	statesMu sync.Mutex
+	states   map[int]*pieceState
+}
+
+type pieceState struct {
+	hash   string
+	length int64
+
+	mu       sync.Mutex
+	buf      []byte
+	complete bool
 }
 
 func newSamogonStorage(cfg *Config, store *Storage, known map[string]bool) *samogonStorage {
 	return &samogonStorage{
-		cfg:   cfg,
-		store: store,
-		sem:   make(chan struct{}, cfg.UpSem),
-		known: known,
+		cfg:    cfg,
+		store:  store,
+		sem:    make(chan struct{}, cfg.UpSem),
+		known:  known,
+		states: map[int]*pieceState{},
 	}
+}
+
+func (s *samogonStorage) stateFor(idx int, hash string, length int64) *pieceState {
+	s.statesMu.Lock()
+	defer s.statesMu.Unlock()
+
+	ps, ok := s.states[idx]
+
+	if !ok {
+		ps = &pieceState{hash: hash, length: length}
+		s.states[idx] = ps
+	}
+
+	return ps
 }
 
 func (s *samogonStorage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
@@ -52,9 +85,8 @@ func (s *samogonStorage) OpenTorrent(ctx context.Context, info *metainfo.Info, i
 		}
 
 		return &samogonPiece{
-			s:      s,
-			hash:   hex.EncodeToString(pieceHash.Value),
-			length: p.Length(),
+			s:  s,
+			st: s.stateFor(p.Index(), hex.EncodeToString(pieceHash.Value), p.Length()),
 		}
 	}
 
@@ -69,43 +101,38 @@ func (s *samogonStorage) Close() error {
 }
 
 type samogonPiece struct {
-	s      *samogonStorage
-	hash   string
-	length int64
-
-	mu       sync.Mutex
-	buf      []byte
-	complete bool
+	s  *samogonStorage
+	st *pieceState
 }
 
-func (p *samogonPiece) ensureBuf() {
-	if p.buf == nil {
-		p.buf = make([]byte, p.length)
+func (st *pieceState) ensureBuf() {
+	if st.buf == nil {
+		st.buf = make([]byte, st.length)
 	}
 }
 
 func (p *samogonPiece) WriteAt(b []byte, off int64) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.st.mu.Lock()
+	defer p.st.mu.Unlock()
 
-	p.ensureBuf()
+	p.st.ensureBuf()
 
 	end := off + int64(len(b))
 
-	if end > int64(len(p.buf)) {
+	if end > int64(len(p.st.buf)) {
 		return 0, io.ErrShortWrite
 	}
 
-	n := copy(p.buf[off:], b)
+	n := copy(p.st.buf[off:], b)
 
 	return n, nil
 }
 
 func (p *samogonPiece) ReadAt(b []byte, off int64) (int, error) {
-	p.mu.Lock()
-	buf := p.buf
-	complete := p.complete
-	p.mu.Unlock()
+	p.st.mu.Lock()
+	buf := p.st.buf
+	complete := p.st.complete
+	p.st.mu.Unlock()
 
 	if buf != nil {
 		if off >= int64(len(buf)) {
@@ -121,7 +148,7 @@ func (p *samogonPiece) ReadAt(b []byte, off int64) (int, error) {
 		// Post-MarkComplete reads are rare in download-only mode
 		// (Seed=false). Fall back to CAS for correctness if it
 		// does happen.
-		data := p.s.store.Cat(p.s.cfg.KeyPiece(p.hash))
+		data := p.s.store.Cat(p.s.cfg.KeyPiece(p.st.hash))
 
 		if off >= int64(len(data)) {
 			return 0, io.EOF
@@ -136,36 +163,36 @@ func (p *samogonPiece) ReadAt(b []byte, off int64) (int, error) {
 }
 
 func (p *samogonPiece) MarkComplete() error {
-	p.mu.Lock()
-	data := p.buf
-	p.mu.Unlock()
+	p.st.mu.Lock()
+	data := p.st.buf
+	p.st.mu.Unlock()
 
 	return runCatch(func() {
 		p.s.sem <- struct{}{}
 		defer func() { <-p.s.sem }()
 
-		p.s.store.PutBytes(p.s.cfg.KeyPiece(p.hash), data)
+		p.s.store.PutBytes(p.s.cfg.KeyPiece(p.st.hash), data)
 
-		p.mu.Lock()
-		p.complete = true
-		p.buf = nil
-		p.mu.Unlock()
+		p.st.mu.Lock()
+		p.st.complete = true
+		p.st.buf = nil
+		p.st.mu.Unlock()
 	})
 }
 
 func (p *samogonPiece) MarkNotComplete() error {
-	p.mu.Lock()
-	p.complete = false
-	p.buf = nil
-	p.mu.Unlock()
+	p.st.mu.Lock()
+	p.st.complete = false
+	p.st.buf = nil
+	p.st.mu.Unlock()
 
 	return nil
 }
 
 func (p *samogonPiece) Completion() storage.Completion {
-	p.mu.Lock()
-	complete := p.complete
-	p.mu.Unlock()
+	p.st.mu.Lock()
+	complete := p.st.complete
+	p.st.mu.Unlock()
 
 	if complete {
 		return storage.Completion{Complete: true, Ok: true}
@@ -174,10 +201,10 @@ func (p *samogonPiece) Completion() storage.Completion {
 	// CAS lookup is in-memory — the hash set was populated once at
 	// fetch start. If a previous run left the piece in S3 we pick
 	// it up as complete; anacrolix then skips downloading it.
-	if p.s.known[p.hash] {
-		p.mu.Lock()
-		p.complete = true
-		p.mu.Unlock()
+	if p.s.known[p.st.hash] {
+		p.st.mu.Lock()
+		p.st.complete = true
+		p.st.mu.Unlock()
 
 		return storage.Completion{Complete: true, Ok: true}
 	}
@@ -258,10 +285,11 @@ func runFetch(cfg *Config) {
 	tcfg.DefaultStorage = newSamogonStorage(cfg, store, known)
 	tcfg.DataDir = scratch
 	tcfg.Seed = false
-	// Lower the anacrolix filter so tracker/DHT/peer events surface
-	// on stderr instead of being swallowed by the default Warning
-	// floor — nothing more infuriating than "fetch is sitting there".
-	tcfg.Logger = alog.Default.FilterLevel(alog.Info)
+	// Warning is anacrolix's default — raising to Info floods stderr
+	// with per-piece / per-peer chatter that drowns our own progress
+	// lines. Real problems (hash failures, tracker errors) come
+	// through at Warning anyway.
+	tcfg.Logger = alog.Default.FilterLevel(alog.Warning)
 
 	logf(clrB, "starting anacrolix client")
 	client := Throw2(torrent.NewClient(tcfg))
