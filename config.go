@@ -165,3 +165,7 @@ func (c *Config) KeyPiece(hash string) string {
 func (c *Config) PrefixTorrents() string {
 	return fmt.Sprintf("samogon/%s/%s/torrents/", c.S3Bucket, c.S3Root)
 }
+
+func (c *Config) PrefixPieces() string {
+	return fmt.Sprintf("samogon/%s/%s/pieces/", c.S3Bucket, c.S3Root)
+}

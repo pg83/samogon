@@ -25,13 +25,20 @@ type samogonStorage struct {
 	cfg   *Config
 	store *Storage
 	sem   chan struct{}
+	// known is the set of piece hashes already in CAS, loaded once
+	// at fetch start via a single `mc ls pieces/`. Per-piece
+	// Completion() checks this map instead of forking minio-client
+	// per piece — 21k+ serial HEADs took anacrolix's AddTorrent off
+	// the cliff before any download started.
+	known map[string]bool
 }
 
-func newSamogonStorage(cfg *Config, store *Storage) *samogonStorage {
+func newSamogonStorage(cfg *Config, store *Storage, known map[string]bool) *samogonStorage {
 	return &samogonStorage{
 		cfg:   cfg,
 		store: store,
 		sem:   make(chan struct{}, cfg.UpSem),
+		known: known,
 	}
 }
 
@@ -69,7 +76,6 @@ type samogonPiece struct {
 	mu       sync.Mutex
 	buf      []byte
 	complete bool
-	checked  bool // we have HEAD-tested the CAS at least once
 }
 
 func (p *samogonPiece) ensureBuf() {
@@ -143,7 +149,6 @@ func (p *samogonPiece) MarkComplete() error {
 		p.mu.Lock()
 		p.complete = true
 		p.buf = nil
-		p.checked = true
 		p.mu.Unlock()
 	})
 }
@@ -160,32 +165,24 @@ func (p *samogonPiece) MarkNotComplete() error {
 func (p *samogonPiece) Completion() storage.Completion {
 	p.mu.Lock()
 	complete := p.complete
-	checked := p.checked
 	p.mu.Unlock()
 
 	if complete {
 		return storage.Completion{Complete: true, Ok: true}
 	}
 
-	if checked {
-		return storage.Completion{Complete: false, Ok: true}
-	}
-
-	// First call — consult CAS once to decide whether this piece
-	// was uploaded by a previous run. A missed upload just means
-	// the piece gets re-downloaded, which is fine.
-	exists := p.s.store.Stat(p.s.cfg.KeyPiece(p.hash))
-
-	p.mu.Lock()
-	p.checked = true
-
-	if exists {
+	// CAS lookup is in-memory — the hash set was populated once at
+	// fetch start. If a previous run left the piece in S3 we pick
+	// it up as complete; anacrolix then skips downloading it.
+	if p.s.known[p.hash] {
+		p.mu.Lock()
 		p.complete = true
+		p.mu.Unlock()
+
+		return storage.Completion{Complete: true, Ok: true}
 	}
 
-	p.mu.Unlock()
-
-	return storage.Completion{Complete: exists, Ok: true}
+	return storage.Completion{Complete: false, Ok: true}
 }
 
 // runCatch executes fn under Try and converts a thrown Exception into
@@ -243,8 +240,22 @@ func runFetch(cfg *Config) {
 
 	logf(clrB, "scratch dir %s", scratch)
 
+	logf(clrB, "listing existing pieces in CAS")
+
+	known := map[string]bool{}
+
+	lsExc := Try(func() {
+		known = store.ListPieces(cfg)
+	})
+
+	lsExc.Catch(func(e *Exception) {
+		logf(clrY, "piece list failed (continuing with empty set): %v", e)
+	})
+
+	logf(clrB, "CAS has %d pieces already", len(known))
+
 	tcfg := torrent.NewDefaultClientConfig()
-	tcfg.DefaultStorage = newSamogonStorage(cfg, store)
+	tcfg.DefaultStorage = newSamogonStorage(cfg, store, known)
 	tcfg.DataDir = scratch
 	tcfg.Seed = false
 	// Lower the anacrolix filter so tracker/DHT/peer events surface

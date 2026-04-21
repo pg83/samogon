@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 )
 
@@ -134,4 +135,19 @@ func (s *Storage) List(prefix string) []string {
 	}
 
 	return names
+}
+
+// ListPieces returns a set of piece hashes (the leaf of each CAS key
+// under PrefixPieces). Called once at fetch start so anacrolix's
+// per-piece Completion() can check an in-memory map instead of
+// forking minio-client per piece.
+func (s *Storage) ListPieces(cfg *Config) map[string]bool {
+	keys := s.List(cfg.PrefixPieces())
+	out := make(map[string]bool, len(keys))
+
+	for _, k := range keys {
+		out[path.Base(k)] = true
+	}
+
+	return out
 }
