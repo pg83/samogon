@@ -17,10 +17,11 @@ type sftpHandlers struct {
 	store *Storage
 	cache *LRU
 	cfg   *Config
+	pref  *Prefetcher
 }
 
-func newSftpHandlers(cfg *Config, meta *Meta, store *Storage, cache *LRU) sftp.Handlers {
-	h := &sftpHandlers{cfg: cfg, meta: meta, store: store, cache: cache}
+func newSftpHandlers(cfg *Config, meta *Meta, store *Storage, cache *LRU, pref *Prefetcher) sftp.Handlers {
+	h := &sftpHandlers{cfg: cfg, meta: meta, store: store, cache: cache, pref: pref}
 
 	return sftp.Handlers{
 		FileGet:  h,
@@ -212,11 +213,9 @@ func (h *sftpHandlers) openFile(p string) *virtualFile {
 	for i := range tm.Files {
 		if tm.Files[i].Path == fpath {
 			return &virtualFile{
-				tm:    tm,
-				file:  &tm.Files[i],
-				store: h.store,
-				cache: h.cache,
-				cfg:   h.cfg,
+				tm:   tm,
+				file: &tm.Files[i],
+				pref: h.pref,
 			}
 		}
 	}
@@ -227,11 +226,9 @@ func (h *sftpHandlers) openFile(p string) *virtualFile {
 }
 
 type virtualFile struct {
-	tm    *TorrentMeta
-	file  *FileEntry
-	store *Storage
-	cache *LRU
-	cfg   *Config
+	tm   *TorrentMeta
+	file *FileEntry
+	pref *Prefetcher
 }
 
 func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
@@ -290,17 +287,34 @@ func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
 	return total, nil
 }
 
-func (v *virtualFile) getPiece(idx int) []byte {
-	h := v.tm.PieceHashes[idx]
+// prefetchK controls the readahead window. Small enough to not thrash
+// a 1000-entry LRU on multiple concurrent streams, large enough to
+// hide S3 latency when reading sequentially (ISO download, video
+// playback). Not exposed as a flag yet — the LRU size is the real
+// tuning knob.
+const prefetchK = 8
 
-	if data, ok := v.cache.Get(h); ok {
-		return data
+func (v *virtualFile) getPiece(idx int) []byte {
+	// Warm up the next K pieces in the background before blocking on
+	// the current one — the prefetch goroutines run in parallel with
+	// the foreground Get via the singleflight pool.
+	if prefetchK > 0 {
+		ahead := make([]string, 0, prefetchK)
+
+		for i := 1; i <= prefetchK; i++ {
+			nxt := idx + i
+
+			if nxt >= len(v.tm.PieceHashes) {
+				break
+			}
+
+			ahead = append(ahead, v.tm.PieceHashes[nxt])
+		}
+
+		v.pref.Prefetch(ahead)
 	}
 
-	data := v.store.Cat(v.cfg.KeyPiece(h))
-	v.cache.Put(h, data)
-
-	return data
+	return v.pref.Get(v.tm.PieceHashes[idx])
 }
 
 type listerAt []os.FileInfo

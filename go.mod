@@ -12,6 +12,7 @@ require (
 	github.com/aws/smithy-go v1.25.0
 	github.com/pkg/sftp v1.13.10
 	golang.org/x/crypto v0.50.0
+	golang.org/x/sync v0.20.0
 )
 
 require (
@@ -94,7 +95,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/net v0.52.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
