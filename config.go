@@ -32,7 +32,7 @@ func loadCommon() *Config {
 		S3Root:     "torrents",
 		ReloadSecs: 30,
 		LRUSize:    1000,
-		UpSem:      32,
+		UpSem:      128,
 		Region:     "us-east-1",
 	}
 

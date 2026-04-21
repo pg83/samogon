@@ -286,12 +286,14 @@ func runFetch(cfg *Config) {
 	tcfg.DataDir = scratch
 	tcfg.Seed = false
 	// anacrolix defaults to 2 hashers per torrent, and MarkComplete
-	// (= our mc-pipe upload) is called synchronously from a hasher
-	// goroutine. At 2 hashers we got ~2 uploads/sec despite a 16-slot
-	// semaphore — upstream bottleneck. 32 keeps the upload pool busy;
-	// memory cost is ~piece_len * hashers (a few MiB at typical piece
-	// sizes), negligible compared to the torrent buffer.
-	tcfg.PieceHashersPerTorrent = 32
+	// (= our S3 PutObject) is called synchronously from a hasher
+	// goroutine. With a 2.7s average PutObject latency on a remote
+	// MinIO, 32 hashers gave ~9 pieces/s — the tail drain after
+	// download completion still took 30+ min on a 21k-piece torrent.
+	// 128 pushes effective throughput proportional to concurrency
+	// (minio handles this level of RPS trivially); memory cost is
+	// ~piece_len × hashers, a handful of MiB at typical sizes.
+	tcfg.PieceHashersPerTorrent = 128
 	// Warning is anacrolix's default — raising to Info floods stderr
 	// with per-piece / per-peer chatter that drowns our own progress
 	// lines. Real problems (hash failures, tracker errors) come
