@@ -305,9 +305,13 @@ func runFetch(cfg *Config) {
 
 	done := make(chan struct{})
 
-	go reportProgress(t, done)
+	st := tcfg.DefaultStorage.(*samogonStorage)
 
+	go reportProgress(t, st, done)
+
+	logf(clrB, "entering client.WaitAll — waits for every MarkComplete (upload) to finish")
 	waited := client.WaitAll()
+	logf(clrB, "client.WaitAll returned")
 
 	close(done)
 
@@ -324,7 +328,7 @@ func runFetch(cfg *Config) {
 	logf(clrG, "done %s", infohash)
 }
 
-func reportProgress(t *torrent.Torrent, done <-chan struct{}) {
+func reportProgress(t *torrent.Torrent, s *samogonStorage, done <-chan struct{}) {
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 
@@ -340,7 +344,7 @@ func reportProgress(t *torrent.Torrent, done <-chan struct{}) {
 		case now := <-tick.C:
 			total := t.Length()
 			got := t.BytesCompleted()
-			st := t.Stats()
+			ts := t.Stats()
 
 			pct := 0.0
 
@@ -358,9 +362,10 @@ func reportProgress(t *torrent.Torrent, done <-chan struct{}) {
 			prevBytes = got
 			prevT = now
 
-			logf(clrB, "%d/%d (%.1f%%) %.1f KiB/s peers=%d active=%d pending=%d seeders=%d",
+			logf(clrB, "%d/%d (%.1f%%) %.1f KiB/s peers=%d active=%d pending=%d seeders=%d uploads=%d/%d",
 				got, total, pct, rate/1024.0,
-				st.TotalPeers, st.ActivePeers, st.PendingPeers, st.ConnectedSeeders)
+				ts.TotalPeers, ts.ActivePeers, ts.PendingPeers, ts.ConnectedSeeders,
+				len(s.sem), cap(s.sem))
 		}
 	}
 }

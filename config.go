@@ -32,7 +32,7 @@ func loadCommon() *Config {
 		S3Root:     "torrents",
 		ReloadSecs: 30,
 		LRUSize:    1000,
-		UpSem:      4,
+		UpSem:      16,
 	}
 
 	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
