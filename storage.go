@@ -40,6 +40,16 @@ func newStorage(cfg *Config) *Storage {
 		Region:      cfg.Region,
 		Credentials: credentials.NewStaticCredentialsProvider(cfg.AWSKey, cfg.AWSSecret, ""),
 		HTTPClient: &http.Client{
+			// Timeout caps total wall-time per request (includes
+			// dial + TLS + headers + body). Without it, a single
+			// stuck TCP connection freezes the singleflight
+			// leader indefinitely, and every worker that
+			// collapses onto that leader parks with it — the
+			// whole pipeline stops. 30s is loose enough that
+			// healthy minio calls (<100ms) never hit it, tight
+			// enough that a dead socket gets evicted before the
+			// user notices.
+			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
 				MaxIdleConns:        256,
 				MaxIdleConnsPerHost: 256,
