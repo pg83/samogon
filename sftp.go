@@ -287,21 +287,17 @@ func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
 	return total, nil
 }
 
-// prefetchK controls the readahead window. Small enough to not thrash
-// a 1000-entry LRU on multiple concurrent streams, large enough to
-// hide S3 latency when reading sequentially (ISO download, video
-// playback). Not exposed as a flag yet — the LRU size is the real
-// tuning knob.
-const prefetchK = 8
-
 func (v *virtualFile) getPiece(idx int) []byte {
 	// Warm up the next K pieces in the background before blocking on
 	// the current one — the prefetch goroutines run in parallel with
-	// the foreground Get via the singleflight pool.
-	if prefetchK > 0 {
-		ahead := make([]string, 0, prefetchK)
+	// the foreground Get via the singleflight pool. K is configurable
+	// (--prefetch-k); 0 disables readahead entirely.
+	k := v.pref.cfg.PrefetchK
 
-		for i := 1; i <= prefetchK; i++ {
+	if k > 0 {
+		ahead := make([]string, 0, k)
+
+		for i := 1; i <= k; i++ {
 			nxt := idx + i
 
 			if nxt >= len(v.tm.PieceHashes) {

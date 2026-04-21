@@ -22,6 +22,7 @@ type Config struct {
 	ReloadSecs int
 	LRUSize    int
 	UpSem      int
+	PrefetchK  int
 	Region     string
 
 	DataDir string
@@ -33,6 +34,7 @@ func loadCommon() *Config {
 		ReloadSecs: 30,
 		LRUSize:    1000,
 		UpSem:      128,
+		PrefetchK:  8,
 		Region:     "us-east-1",
 	}
 
@@ -104,6 +106,8 @@ func parseServeArgs(args []string) *Config {
 	fs.StringVar(&c.HostKey, "host-key", "", "path to SSH host private key (PEM)")
 	fs.IntVar(&c.ReloadSecs, "reload", c.ReloadSecs, "torrents/ reload interval (seconds)")
 	fs.IntVar(&c.LRUSize, "lru", c.LRUSize, "piece cache size (entries)")
+	fs.IntVar(&c.UpSem, "up-parallel", c.UpSem, "max concurrent GetObject calls")
+	fs.IntVar(&c.PrefetchK, "prefetch-k", c.PrefetchK, "pieces to readahead on every getPiece (0 disables)")
 
 	Throw(fs.Parse(args))
 

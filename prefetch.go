@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -27,10 +28,13 @@ type Prefetcher struct {
 	sf  singleflight.Group
 	sem chan struct{}
 
-	hits   atomic.Int64
-	misses atomic.Int64
-	preIss atomic.Int64
-	preHit atomic.Int64
+	hits      atomic.Int64
+	misses    atomic.Int64
+	preIss    atomic.Int64
+	preHit    atomic.Int64
+	fetchN    atomic.Int64 // completed GetObject calls (unique, via singleflight)
+	fetchNs   atomic.Int64 // cumulative GetObject latency in ns
+	inFlight  atomic.Int64 // concurrent GetObject calls in progress
 }
 
 func newPrefetcher(cfg *Config, store *Storage, cache *LRU, concurrency int) *Prefetcher {
@@ -60,7 +64,15 @@ func (p *Prefetcher) Get(hash string) []byte {
 			return data, nil
 		}
 
+		p.inFlight.Add(1)
+		t0 := time.Now()
+
 		data := p.store.Cat(p.cfg.KeyPiece(hash))
+
+		p.fetchNs.Add(time.Since(t0).Nanoseconds())
+		p.fetchN.Add(1)
+		p.inFlight.Add(-1)
+
 		p.cache.Put(hash, data)
 
 		return data, nil
@@ -106,6 +118,16 @@ func (p *Prefetcher) Prefetch(hashes []string) {
 }
 
 func (p *Prefetcher) Stats() string {
-	return fmt.Sprintf("hits=%d misses=%d prefetch-issued=%d prefetch-hit=%d",
-		p.hits.Load(), p.misses.Load(), p.preIss.Load(), p.preHit.Load())
+	n := p.fetchN.Load()
+	avgMs := 0.0
+
+	if n > 0 {
+		avgMs = float64(p.fetchNs.Load()) / float64(n) / 1e6
+	}
+
+	return fmt.Sprintf(
+		"hits=%d misses=%d prefetch-issued=%d prefetch-hit=%d fetched=%d inflight=%d/%d avg-fetch=%.1fms",
+		p.hits.Load(), p.misses.Load(),
+		p.preIss.Load(), p.preHit.Load(),
+		n, p.inFlight.Load(), cap(p.sem), avgMs)
 }
