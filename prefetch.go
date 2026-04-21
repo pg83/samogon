@@ -116,11 +116,17 @@ func (p *Prefetcher) Get(hash string) []byte {
 }
 
 // Prefetch enqueues hashes for asynchronous fetching. Non-blocking —
-// if the queue is full, the request is dropped (foreground Get will
-// fetch on demand when it arrives). Pieces already in cache are
-// skipped at enqueue time.
+// if the queue is full we stop iterating (the remaining hashes, all
+// farther from the reader, would just get dropped anyway). Pieces
+// already in cache are skipped at enqueue time.
+//
+// The early exit matters a lot at large K. On each getPiece we get
+// called with K hashes; iterating to 5000 takes 5000 cache.Get calls
+// against the LRU mutex, and with workers + foreground all
+// contending, that alone becomes the bottleneck long before the
+// extra prefetches could ever land usefully.
 func (p *Prefetcher) Prefetch(hashes []string) {
-	for _, h := range hashes {
+	for i, h := range hashes {
 		if _, ok := p.cache.Get(h); ok {
 			p.preHit.Add(1)
 
@@ -132,7 +138,12 @@ func (p *Prefetcher) Prefetch(hashes []string) {
 			p.preIss.Add(1)
 
 		default:
-			p.preDrop.Add(1)
+			// Account for everything we didn't even try — gives
+			// a truthful ratio of "asked vs delivered to
+			// workers" when K is oversized.
+			p.preDrop.Add(int64(len(hashes) - i))
+
+			return
 		}
 	}
 }
