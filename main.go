@@ -42,6 +42,8 @@ Subcommands:
               torrents/pieces/<hash> and the .torrent itself as
               torrents/torrents/<infohash>
   serve       SFTP daemon streaming from S3-backed CAS
+  get         local download of a single file — same Storage/
+              Prefetcher/virtualFile chain as serve, no SFTP
   bench       PutObject throughput test — N goroutines spam fixed-
               size chunks at the endpoint, reports ops/s + MiB/s
 
@@ -80,6 +82,10 @@ func main() {
 
 		case "serve":
 			runServe(parseServeArgs(rest))
+
+		case "get":
+			cfg, opts := parseGetArgs(rest)
+			runGet(cfg, opts)
 
 		case "bench":
 			cfg, opts := parseBenchArgs(rest)
