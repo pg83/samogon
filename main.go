@@ -42,6 +42,8 @@ Subcommands:
               torrents/pieces/<hash> and the .torrent itself as
               torrents/torrents/<infohash>
   serve       SFTP daemon streaming from S3-backed CAS
+  bench       PutObject throughput test — N goroutines spam fixed-
+              size chunks at the endpoint, reports ops/s + MiB/s
 
 Env (shared):
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
@@ -78,6 +80,10 @@ func main() {
 
 		case "serve":
 			runServe(parseServeArgs(rest))
+
+		case "bench":
+			cfg, opts := parseBenchArgs(rest)
+			runBench(cfg, opts)
 
 		default:
 			ThrowFmt("unknown subcommand: %s", sub)
