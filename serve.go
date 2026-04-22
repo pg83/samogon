@@ -18,7 +18,6 @@ func runServe(cfg *Config) {
 
 	cache := newLRU(cfg.LRUSize)
 	meta := newMeta(cfg, store)
-	pref := newPrefetcher(cfg, store, cache, cfg.UpSem)
 
 	// Initial load is advisory — the bucket may not exist yet on a
 	// fresh deployment, or S3 may be transiently unreachable. Log
@@ -45,7 +44,7 @@ func runServe(cfg *Config) {
 
 		go func(c net.Conn) {
 			exc := Try(func() {
-				handleConn(c, sshCfg, cfg, meta, store, cache, pref)
+				handleConn(c, sshCfg, cfg, meta, store, cache)
 			})
 
 			exc.Catch(func(e *Exception) {
@@ -143,7 +142,7 @@ func loadAuthorizedKeys(path string) []ssh.PublicKey {
 	return out
 }
 
-func handleConn(conn net.Conn, sshCfg *ssh.ServerConfig, cfg *Config, meta *Meta, store *Storage, cache *LRU, pref *Prefetcher) {
+func handleConn(conn net.Conn, sshCfg *ssh.ServerConfig, cfg *Config, meta *Meta, store *Storage, cache *LRU) {
 	defer conn.Close()
 
 	_, chans, reqs, err := ssh.NewServerConn(conn, sshCfg)
@@ -163,7 +162,7 @@ func handleConn(conn net.Conn, sshCfg *ssh.ServerConfig, cfg *Config, meta *Meta
 
 		go func(nc ssh.NewChannel) {
 			exc := Try(func() {
-				handleSession(nc, cfg, meta, store, cache, pref)
+				handleSession(nc, cfg, meta, store, cache)
 			})
 
 			exc.Catch(func(e *Exception) {
@@ -173,7 +172,7 @@ func handleConn(conn net.Conn, sshCfg *ssh.ServerConfig, cfg *Config, meta *Meta
 	}
 }
 
-func handleSession(nc ssh.NewChannel, cfg *Config, meta *Meta, store *Storage, cache *LRU, pref *Prefetcher) {
+func handleSession(nc ssh.NewChannel, cfg *Config, meta *Meta, store *Storage, cache *LRU) {
 	ch, reqs, err := nc.Accept()
 
 	if err != nil {
@@ -206,7 +205,7 @@ func handleSession(nc ssh.NewChannel, cfg *Config, meta *Meta, store *Storage, c
 		return
 	}
 
-	handlers := newSftpHandlers(cfg, meta, store, cache, pref)
+	handlers := newSftpHandlers(cfg, meta, store, cache)
 	srv := sftp.NewRequestServer(ch, handlers)
 	defer srv.Close()
 

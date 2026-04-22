@@ -42,8 +42,8 @@ Subcommands:
               torrents/pieces/<hash> and the .torrent itself as
               torrents/torrents/<infohash>
   serve       SFTP daemon streaming from S3-backed CAS
-  get         local download of a single file — same Storage/
-              Prefetcher/virtualFile chain as serve, no SFTP
+  get         local download of a single file — same Storage/LRU/
+              virtualFile chain as serve, no SFTP
   get2        raw-read benchmark: grabs every piece of a file in
               arbitrary order across N workers, no cache or disk —
               isolates minio/network from the get pipeline

@@ -17,11 +17,10 @@ type sftpHandlers struct {
 	store *Storage
 	cache *LRU
 	cfg   *Config
-	pref  *Prefetcher
 }
 
-func newSftpHandlers(cfg *Config, meta *Meta, store *Storage, cache *LRU, pref *Prefetcher) sftp.Handlers {
-	h := &sftpHandlers{cfg: cfg, meta: meta, store: store, cache: cache, pref: pref}
+func newSftpHandlers(cfg *Config, meta *Meta, store *Storage, cache *LRU) sftp.Handlers {
+	h := &sftpHandlers{cfg: cfg, meta: meta, store: store, cache: cache}
 
 	return sftp.Handlers{
 		FileGet:  h,
@@ -213,9 +212,11 @@ func (h *sftpHandlers) openFile(p string) *virtualFile {
 	for i := range tm.Files {
 		if tm.Files[i].Path == fpath {
 			return &virtualFile{
-				tm:   tm,
-				file: &tm.Files[i],
-				pref: h.pref,
+				tm:    tm,
+				file:  &tm.Files[i],
+				cfg:   h.cfg,
+				store: h.store,
+				cache: h.cache,
 			}
 		}
 	}
@@ -226,10 +227,17 @@ func (h *sftpHandlers) openFile(p string) *virtualFile {
 }
 
 type virtualFile struct {
-	tm   *TorrentMeta
-	file *FileEntry
-	pref *Prefetcher
+	tm    *TorrentMeta
+	file  *FileEntry
+	cfg   *Config
+	store *Storage
+	cache *LRU
 }
+
+// prefetchDistance — how far ahead of the reader to schedule a
+// background GetObject on every ReadAt. Fixed at 32 because the
+// typical OpenSSH SFTP client pipelines ~32 FXP_READ requests.
+const prefetchDistance = 32
 
 func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
@@ -288,25 +296,35 @@ func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (v *virtualFile) getPiece(idx int) []byte {
-	// Submit a [idx+1, idx+1+K) range to the prefetcher on every
-	// step; Submit blocks if the queue is full, which is the
-	// backpressure we want. K is configurable (--prefetch-k).
-	k := v.pref.cfg.PrefetchK
+	// Fire-and-forget prefetch of idx+prefetchDistance. Goroutine
+	// is cheap; LRU.Get guard inside dodges the GetObject if the
+	// piece is already cached by the time the goroutine runs.
+	if next := idx + prefetchDistance; next < len(v.tm.PieceHashes) {
+		hash := v.tm.PieceHashes[next]
 
-	if k > 0 {
-		start := idx + 1
-		end := start + k
+		go func() {
+			if _, ok := v.cache.Get(hash); ok {
+				return
+			}
 
-		if end > len(v.tm.PieceHashes) {
-			end = len(v.tm.PieceHashes)
-		}
-
-		if start < end {
-			v.pref.Submit(v.tm.PieceHashes[start:end])
-		}
+			// Errors on prefetch are non-fatal — the foreground
+			// Read will hit the same key and surface them itself.
+			_ = Try(func() {
+				v.cache.Put(hash, v.store.Cat(v.cfg.KeyPiece(hash)))
+			})
+		}()
 	}
 
-	return v.pref.Get(v.tm.PieceHashes[idx])
+	hash := v.tm.PieceHashes[idx]
+
+	if data, ok := v.cache.Get(hash); ok {
+		return data
+	}
+
+	data := v.store.Cat(v.cfg.KeyPiece(hash))
+	v.cache.Put(hash, data)
+
+	return data
 }
 
 type listerAt []os.FileInfo

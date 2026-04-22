@@ -12,10 +12,9 @@ import (
 )
 
 // get is a local test harness for the serve-side read path. It wires
-// up the same Storage → LRU → Prefetcher → virtualFile chain that
-// handleSession builds for SFTP clients, then streams a single file
-// out to disk. Useful for measuring prefetcher behavior (cache
-// hit/miss ratio, throughput, latency) without an SFTP client in
+// up the same Storage → LRU → virtualFile chain that handleSession
+// builds for SFTP clients, then streams a single file out to disk.
+// Useful for measuring read throughput without an SFTP client in
 // the loop.
 
 type getOpts struct {
@@ -37,8 +36,6 @@ func parseGetArgs(args []string) (*Config, getOpts) {
 	fs.StringVar(&c.S3Root, "s3-root", c.S3Root, "S3 key prefix (env SAMOGON_S3_ROOT)")
 	fs.StringVar(&c.Region, "region", c.Region, "S3 region")
 	fs.IntVar(&c.LRUSize, "lru", c.LRUSize, "piece cache size (entries)")
-	fs.IntVar(&c.UpSem, "up-parallel", c.UpSem, "max concurrent GetObject calls")
-	fs.IntVar(&c.PrefetchK, "prefetch-k", c.PrefetchK, "pieces to readahead on every getPiece (0 disables)")
 
 	opts := getOpts{}
 
@@ -72,7 +69,6 @@ func runGet(cfg *Config, opts getOpts) {
 
 	cache := newLRU(cfg.LRUSize)
 	meta := newMeta(cfg, store)
-	pref := newPrefetcher(cfg, store, cache, cfg.UpSem)
 
 	fmt.Fprintln(os.Stderr, clr(clrB, "get: loading meta"))
 	meta.Reload()
@@ -123,24 +119,26 @@ func runGet(cfg *Config, opts getOpts) {
 	}
 
 	vf := &virtualFile{
-		tm:   tm,
-		file: file,
-		pref: pref,
+		tm:    tm,
+		file:  file,
+		cfg:   cfg,
+		store: store,
+		cache: cache,
 	}
 
 	out := Throw2(os.Create(opts.outPath))
 	defer out.Close()
 
 	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf(
-		"get: %s (%d bytes) → %s  chunk=%d  lru=%d  up-parallel=%d",
-		opts.target, file.Size, opts.outPath, opts.chunk, cfg.LRUSize, cfg.UpSem)))
+		"get: %s (%d bytes) → %s  chunk=%d  lru=%d",
+		opts.target, file.Size, opts.outPath, opts.chunk, cfg.LRUSize)))
 
 	var gotBytes atomic.Int64
 
 	start := time.Now()
 	done := make(chan struct{})
 
-	go getReporter(&gotBytes, file.Size, pref, start, done)
+	go getReporter(&gotBytes, file.Size, start, done)
 
 	buf := make([]byte, opts.chunk)
 	off := int64(0)
@@ -179,12 +177,12 @@ func runGet(cfg *Config, opts getOpts) {
 	rate := float64(off) / elapsed.Seconds()
 
 	fmt.Fprintln(os.Stderr, clr(clrG, fmt.Sprintf(
-		"get: done — %d bytes in %s  %.2f MiB/s  [%s]",
+		"get: done — %d bytes in %s  %.2f MiB/s",
 		off, elapsed.Round(time.Millisecond),
-		rate/(1024*1024), pref.Stats())))
+		rate/(1024*1024))))
 }
 
-func getReporter(bytes *atomic.Int64, total int64, pref *Prefetcher, start time.Time, done <-chan struct{}) {
+func getReporter(bytes *atomic.Int64, total int64, start time.Time, done <-chan struct{}) {
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 
@@ -210,8 +208,8 @@ func getReporter(bytes *atomic.Int64, total int64, pref *Prefetcher, start time.
 			}
 
 			fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf(
-				"get: %d/%d (%.1f%%)  %.2f MiB/s  %s",
-				cur, total, pct, rate/(1024*1024), pref.Stats())))
+				"get: %d/%d (%.1f%%)  %.2f MiB/s",
+				cur, total, pct, rate/(1024*1024))))
 		}
 	}
 }
