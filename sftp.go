@@ -234,11 +234,6 @@ type virtualFile struct {
 	cache *LRU
 }
 
-// prefetchDistance — how far ahead of the reader to schedule a
-// background GetObject on every ReadAt. Fixed at 32 because the
-// typical OpenSSH SFTP client pipelines ~32 FXP_READ requests.
-const prefetchDistance = 32
-
 func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("negative offset")
@@ -296,11 +291,13 @@ func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (v *virtualFile) getPiece(idx int) []byte {
-	// Fire-and-forget prefetch of idx+prefetchDistance. Goroutine
+	// Fire-and-forget prefetch of idx+PrefetchDistance. Goroutine
 	// is cheap; LRU.Get guard inside dodges the GetObject if the
 	// piece is already cached by the time the goroutine runs.
-	if next := idx + prefetchDistance; next < len(v.tm.PieceHashes) {
-		hash := v.tm.PieceHashes[next]
+	// Default distance 32 ≈ typical SFTP client pipeline depth;
+	// tunable via --prefetch-distance (0 disables).
+	if d := v.cfg.PrefetchDistance; d > 0 && idx+d < len(v.tm.PieceHashes) {
+		hash := v.tm.PieceHashes[idx+d]
 
 		go func() {
 			if _, ok := v.cache.Get(hash); ok {

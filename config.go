@@ -19,10 +19,11 @@ type Config struct {
 	Pass       string
 	AuthKeys   string
 	HostKey    string
-	ReloadSecs int
-	LRUSize    int
-	UpSem      int
-	Region     string
+	ReloadSecs       int
+	LRUSize          int
+	UpSem            int
+	PrefetchDistance int
+	Region           string
 
 	DataDir string
 }
@@ -31,9 +32,10 @@ func loadCommon() *Config {
 	c := &Config{
 		S3Root:     "torrents",
 		ReloadSecs: 30,
-		LRUSize:    1000,
-		UpSem:      128,
-		Region:     "us-east-1",
+		LRUSize:          1000,
+		UpSem:            128,
+		PrefetchDistance: 32,
+		Region:           "us-east-1",
 	}
 
 	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
@@ -105,6 +107,7 @@ func parseServeArgs(args []string) *Config {
 	fs.IntVar(&c.ReloadSecs, "reload", c.ReloadSecs, "torrents/ reload interval (seconds)")
 	fs.IntVar(&c.LRUSize, "lru", c.LRUSize, "piece cache size (entries)")
 	fs.IntVar(&c.UpSem, "up-parallel", c.UpSem, "max concurrent GetObject calls")
+	fs.IntVar(&c.PrefetchDistance, "prefetch-distance", c.PrefetchDistance, "pieces to readahead on every getPiece (0 disables)")
 
 	Throw(fs.Parse(args))
 

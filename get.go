@@ -36,6 +36,7 @@ func parseGetArgs(args []string) (*Config, getOpts) {
 	fs.StringVar(&c.S3Root, "s3-root", c.S3Root, "S3 key prefix (env SAMOGON_S3_ROOT)")
 	fs.StringVar(&c.Region, "region", c.Region, "S3 region")
 	fs.IntVar(&c.LRUSize, "lru", c.LRUSize, "piece cache size (entries)")
+	fs.IntVar(&c.PrefetchDistance, "prefetch-distance", c.PrefetchDistance, "pieces to readahead on every getPiece (0 disables)")
 
 	opts := getOpts{}
 
