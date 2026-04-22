@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // get is a local test harness for the serve-side read path. It wires
@@ -125,6 +127,7 @@ func runGet(cfg *Config, opts getOpts) {
 		cfg:   cfg,
 		store: store,
 		cache: cache,
+		group: &singleflight.Group{},
 	}
 
 	out := Throw2(os.Create(opts.outPath))

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"golang.org/x/sync/singleflight"
 )
 
 type sftpHandlers struct {
@@ -17,10 +18,11 @@ type sftpHandlers struct {
 	store *Storage
 	cache *LRU
 	cfg   *Config
+	group *singleflight.Group
 }
 
 func newSftpHandlers(cfg *Config, meta *Meta, store *Storage, cache *LRU) sftp.Handlers {
-	h := &sftpHandlers{cfg: cfg, meta: meta, store: store, cache: cache}
+	h := &sftpHandlers{cfg: cfg, meta: meta, store: store, cache: cache, group: &singleflight.Group{}}
 
 	return sftp.Handlers{
 		FileGet:  h,
@@ -217,6 +219,7 @@ func (h *sftpHandlers) openFile(p string) *virtualFile {
 				cfg:   h.cfg,
 				store: h.store,
 				cache: h.cache,
+				group: h.group,
 			}
 		}
 	}
@@ -232,6 +235,7 @@ type virtualFile struct {
 	cfg   *Config
 	store *Storage
 	cache *LRU
+	group *singleflight.Group
 }
 
 func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
@@ -300,14 +304,21 @@ func (v *virtualFile) getPiece(idx int) []byte {
 		hash := v.tm.PieceHashes[idx+d]
 
 		go func() {
-			if _, ok := v.cache.Get(hash); ok {
-				return
-			}
+			// singleflight collapses concurrent fetches of the
+			// same hash — both prefetch goroutines for the same
+			// piece AND foreground reads racing with a live
+			// prefetch — into one GetObject per key. Errors are
+			// swallowed here; the foreground read re-enters the
+			// same singleflight slot and surfaces them.
+			_, _, _ = v.group.Do(hash, func() (any, error) {
+				if _, ok := v.cache.Get(hash); ok {
+					return nil, nil
+				}
+				_ = Try(func() {
+					v.cache.Put(hash, v.store.Cat(v.cfg.KeyPiece(hash)))
+				})
 
-			// Errors on prefetch are non-fatal — the foreground
-			// Read will hit the same key and surface them itself.
-			_ = Try(func() {
-				v.cache.Put(hash, v.store.Cat(v.cfg.KeyPiece(hash)))
+				return nil, nil
 			})
 		}()
 	}
@@ -318,8 +329,16 @@ func (v *virtualFile) getPiece(idx int) []byte {
 		return data
 	}
 
-	data := v.store.Cat(v.cfg.KeyPiece(hash))
-	v.cache.Put(hash, data)
+	_, _, _ = v.group.Do(hash, func() (any, error) {
+		if _, ok := v.cache.Get(hash); ok {
+			return nil, nil
+		}
+		v.cache.Put(hash, v.store.Cat(v.cfg.KeyPiece(hash)))
+
+		return nil, nil
+	})
+
+	data, _ := v.cache.Get(hash)
 
 	return data
 }
