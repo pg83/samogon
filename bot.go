@@ -151,25 +151,60 @@ func handleDocument(api *tgbotapi.BotAPI, cfg *Config, msg *tgbotapi.Message) {
 		return
 	}
 
-	reply(api, msg.Chat.ID, msg.MessageID, fmt.Sprintf("queued: %s (%d bytes)", doc.FileName, len(raw)))
+	// Spawn `gorn ignite ... -- samogon fetch`, pipe torrent bytes
+	// on stdin — ignite's synthesizeScript embeds them as base64
+	// and the worker pipes them into samogon fetch's stdin.
+	//
+	// No --wait: fire-and-forget. ignite POSTs the task to the gorn
+	// control API and returns immediately with the GUID on stdout.
+	// The bot replies with that GUID so the user can track progress
+	// via gorn web / `gorn ignite --wait --guid <G>` later.
+	//
+	//  --api      inherited from $GORN_API in our env via ignite's
+	//             own fallback (ignite inherits env by default).
+	//  --root     S3 prefix for ignite's own artifacts (stdout,
+	//             stderr, result.json); keeps them under
+	//             gorn/samogon/ instead of mixing with CI's gorn/cli/.
+	//  --env K=V  forward every env key samogon fetch actually needs
+	//             into the worker side. ignite does not propagate
+	//             the bot's ambient env; only what we pass here
+	//             lands on the worker.
+	//  --descr    human-readable task description — shown in gorn web.
+	args := []string{
+		"ignite",
+		"--root", "samogon",
+		"--descr", "samogon fetch " + doc.FileName,
+	}
 
-	// Spawn `gorn ignite -- samogon fetch`, pipe torrent bytes on
-	// stdin. stdout/stderr of the child propagate to our stderr for
-	// logging; the bot doesn't interpret them.
-	cmd := exec.Command("gorn", "ignite", "--", "samogon", "fetch")
+	for _, k := range []string{
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"S3_ENDPOINT",
+		"S3_BUCKET",
+		"SAMOGON_S3_ROOT",
+	} {
+		if v := os.Getenv(k); v != "" {
+			args = append(args, "--env", k+"="+v)
+		}
+	}
+
+	args = append(args, "--", "samogon", "fetch")
+
+	var out bytes.Buffer
+
+	cmd := exec.Command("gorn", args...)
 	cmd.Stdin = bytes.NewReader(raw)
-	cmd.Stdout = os.Stderr
+	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
 
-	err = cmd.Run()
-
-	if err != nil {
-		reply(api, msg.Chat.ID, msg.MessageID, "fetch failed: "+err.Error())
+	if err := cmd.Run(); err != nil {
+		reply(api, msg.Chat.ID, msg.MessageID, "ignite failed: "+err.Error())
 
 		return
 	}
 
-	reply(api, msg.Chat.ID, msg.MessageID, "done: "+doc.FileName)
+	guid := strings.TrimSpace(out.String())
+	reply(api, msg.Chat.ID, msg.MessageID, fmt.Sprintf("queued: %s  guid=%s", doc.FileName, guid))
 }
 
 func reply(api *tgbotapi.BotAPI, chatID int64, replyTo int, text string) {
