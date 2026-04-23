@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,6 +14,7 @@ import (
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"golang.org/x/net/proxy"
 )
 
 // bot is a Telegram bot front-end for `samogon fetch`. Users send
@@ -31,6 +34,7 @@ func parseBotArgs(args []string) *Config {
 
 	fs.StringVar(&c.TgToken, "tg-token", os.Getenv("TG_BOT_TOKEN"), "Telegram Bot API token (env TG_BOT_TOKEN)")
 	fs.StringVar(&c.TgAllowUsers, "tg-allow-users", os.Getenv("TG_ALLOW_USERS"), "comma-separated Telegram user IDs allowed to send torrents (env TG_ALLOW_USERS)")
+	fs.StringVar(&c.Socks5, "socks5", os.Getenv("SAMOGON_SOCKS5"), "host:port of a SOCKS5 proxy for Telegram HTTPS calls (env SAMOGON_SOCKS5); empty = direct")
 
 	Throw(fs.Parse(args))
 
@@ -58,7 +62,19 @@ func runBot(cfg *Config) {
 
 	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("bot: allowing %d user(s)", len(allow))))
 
-	api := Throw2(tgbotapi.NewBotAPI(cfg.TgToken))
+	// Lab hosts don't have direct outbound to api.telegram.org; route
+	// both the Bot API client and file downloads through the cluster
+	// SOCKS5 proxy when --socks5 (or SAMOGON_SOCKS5) is set. One
+	// shared http.Client keeps TLS sessions + keepalives alive across
+	// both paths.
+	httpClient := http.DefaultClient
+
+	if cfg.Socks5 != "" {
+		fmt.Fprintln(os.Stderr, clr(clrB, "bot: routing HTTPS via socks5 "+cfg.Socks5))
+		httpClient = newSocks5Client(cfg.Socks5)
+	}
+
+	api := Throw2(tgbotapi.NewBotAPIWithClient(cfg.TgToken, tgbotapi.APIEndpoint, httpClient))
 	fmt.Fprintln(os.Stderr, clr(clrG, "bot: authorized as @"+api.Self.UserName))
 
 	upd := tgbotapi.NewUpdate(0)
@@ -133,7 +149,9 @@ func handleDocument(api *tgbotapi.BotAPI, cfg *Config, msg *tgbotapi.Message) {
 		return
 	}
 
-	resp, err := http.Get(file.Link(cfg.TgToken))
+	// Reuse the bot API's client so file downloads go through the
+	// same SOCKS5 proxy (if configured) + TLS session cache.
+	resp, err := api.Client.(*http.Client).Get(file.Link(cfg.TgToken))
 
 	if err != nil {
 		reply(api, msg.Chat.ID, msg.MessageID, "download failed: "+err.Error())
@@ -213,5 +231,31 @@ func reply(api *tgbotapi.BotAPI, chatID int64, replyTo int, text string) {
 
 	if _, err := api.Send(m); err != nil {
 		fmt.Fprintln(os.Stderr, clr(clrY, "bot: reply failed: "+err.Error()))
+	}
+}
+
+// newSocks5Client wires a SOCKS5 dialer into an http.Transport so
+// every request issued by the returned client hops through the
+// proxy. golang.org/x/net/proxy provides the context-aware dialer
+// that http.Transport.DialContext expects.
+func newSocks5Client(addr string) *http.Client {
+	d, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+
+	if err != nil {
+		ThrowFmt("bot: socks5 dialer %q: %v", addr, err)
+	}
+
+	cd, ok := d.(proxy.ContextDialer)
+
+	if !ok {
+		ThrowFmt("bot: socks5 dialer %q is not a ContextDialer", addr)
+	}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return cd.DialContext(ctx, network, address)
+			},
+		},
 	}
 }

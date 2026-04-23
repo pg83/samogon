@@ -28,6 +28,7 @@ type Config struct {
 
 	TgToken      string
 	TgAllowUsers string
+	Socks5       string
 
 	DataDir string
 }
