@@ -49,10 +49,15 @@ Subcommands:
               isolates minio/network from the get pipeline
   bench       PutObject throughput test — N goroutines spam fixed-
               size chunks at the endpoint, reports ops/s + MiB/s
+  bot         Telegram bot front-end for fetch — accepts .torrent
+              files from an allow-listed set of users and pipes each
+              into gorn ignite -- samogon fetch
 
 Env (shared):
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
   S3_ENDPOINT, S3_BUCKET, SAMOGON_S3_ROOT
+Env (bot):
+  TG_BOT_TOKEN, TG_ALLOW_USERS
 
 Pass --help to a subcommand for its flags.
 `
@@ -97,6 +102,9 @@ func main() {
 		case "bench":
 			cfg, opts := parseBenchArgs(rest)
 			runBench(cfg, opts)
+
+		case "bot":
+			runBot(parseBotArgs(rest))
 
 		default:
 			ThrowFmt("unknown subcommand: %s", sub)

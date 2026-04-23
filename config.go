@@ -26,6 +26,9 @@ type Config struct {
 	InflightPieces   int
 	Region           string
 
+	TgToken      string
+	TgAllowUsers string
+
 	DataDir string
 }
 
