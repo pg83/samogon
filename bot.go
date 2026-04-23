@@ -196,6 +196,11 @@ func handleDocument(api *tgbotapi.BotAPI, cfg *Config, msg *tgbotapi.Message) {
 		"ignite",
 		"--root", "samogon",
 		"--descr", "samogon fetch " + doc.FileName,
+		// samogon fetch reports torrent outcome through S3 side-channels;
+		// any exit != 0 we see from it is infra noise (gorn worker OOM,
+		// S3 hiccup) that should bounce back onto the queue instead of
+		// silently getting discarded as a "non-retriable" build failure.
+		"--retry-error",
 	}
 
 	for _, k := range []string{
