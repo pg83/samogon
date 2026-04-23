@@ -78,7 +78,11 @@ func runBot(cfg *Config) {
 	fmt.Fprintln(os.Stderr, clr(clrG, "bot: authorized as @"+api.Self.UserName))
 
 	upd := tgbotapi.NewUpdate(0)
-	upd.Timeout = 60
+	// Stay shorter than the narrowest idle timeout in the
+	// bot → haproxy(8015) → ssh -D → exit → api.telegram.org chain.
+	// Observed EOF at ~54s in production → 30s leaves plenty of
+	// headroom without noticeably extra API traffic.
+	upd.Timeout = 30
 	upd.AllowedUpdates = []string{"message"}
 
 	updates := api.GetUpdatesChan(upd)
