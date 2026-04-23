@@ -25,6 +25,16 @@ type samogonStorage struct {
 	cfg   *Config
 	store *Storage
 	sem   chan struct{}
+	// bufSem caps the number of pieces that currently hold an
+	// in-RAM buffer (downloaded or being downloaded, not yet
+	// uploaded to CAS). First WriteAt on a piece acquires a slot
+	// before `make([]byte, piece_len)`; MarkComplete / MarkNotComplete
+	// releases it. Bound caps peak memory at
+	//   InflightPieces × piece_len   (≈ 1000 × 4 MiB = 4 GiB max).
+	// WriteAt blocks when the cap is reached, which backpressures
+	// anacrolix's peer reader: new piece data can't be consumed
+	// until an earlier piece finishes uploading and frees a slot.
+	bufSem chan struct{}
 	// known is the set of piece hashes already in CAS, loaded once
 	// at fetch start via a single `mc ls pieces/`. Per-piece
 	// Completion() checks this map instead of forking minio-client
@@ -56,6 +66,7 @@ func newSamogonStorage(cfg *Config, store *Storage, known map[string]bool) *samo
 		cfg:    cfg,
 		store:  store,
 		sem:    make(chan struct{}, cfg.UpSem),
+		bufSem: make(chan struct{}, cfg.InflightPieces),
 		known:  known,
 		states: map[int]*pieceState{},
 	}
@@ -105,25 +116,38 @@ type samogonPiece struct {
 	st *pieceState
 }
 
-func (st *pieceState) ensureBuf() {
-	if st.buf == nil {
-		st.buf = make([]byte, st.length)
-	}
-}
-
 func (p *samogonPiece) WriteAt(b []byte, off int64) (int, error) {
 	p.st.mu.Lock()
-	defer p.st.mu.Unlock()
 
-	p.st.ensureBuf()
+	if p.st.buf == nil {
+		// Acquire a buffer slot. Blocks when InflightPieces are
+		// already held in RAM — anacrolix's peer reader then stalls
+		// here until an earlier piece finishes uploading (MarkComplete
+		// releases). Unlock mu while waiting: another WriteAt on the
+		// same piece may race ahead and allocate; re-check after.
+		p.st.mu.Unlock()
+		p.s.bufSem <- struct{}{}
+		p.st.mu.Lock()
+
+		if p.st.buf == nil {
+			p.st.buf = make([]byte, p.st.length)
+		} else {
+			// Someone else allocated while we waited. Release the
+			// spare slot we acquired so we don't double-count.
+			<-p.s.bufSem
+		}
+	}
 
 	end := off + int64(len(b))
 
 	if end > int64(len(p.st.buf)) {
+		p.st.mu.Unlock()
+
 		return 0, io.ErrShortWrite
 	}
 
 	n := copy(p.st.buf[off:], b)
+	p.st.mu.Unlock()
 
 	return n, nil
 }
@@ -175,16 +199,26 @@ func (p *samogonPiece) MarkComplete() error {
 
 		p.st.mu.Lock()
 		p.st.complete = true
+		freed := p.st.buf != nil
 		p.st.buf = nil
 		p.st.mu.Unlock()
+
+		if freed {
+			<-p.s.bufSem
+		}
 	})
 }
 
 func (p *samogonPiece) MarkNotComplete() error {
 	p.st.mu.Lock()
 	p.st.complete = false
+	freed := p.st.buf != nil
 	p.st.buf = nil
 	p.st.mu.Unlock()
+
+	if freed {
+		<-p.s.bufSem
+	}
 
 	return nil
 }
@@ -371,10 +405,12 @@ func reportProgress(t *torrent.Torrent, s *samogonStorage, done <-chan struct{})
 			prevBytes = got
 			prevT = now
 
-			logf(clrB, "%d/%d (%.1f%%) %.1f KiB/s peers=%d active=%d pending=%d seeders=%d uploads=%d/%d puts=%d",
+			logf(clrB, "%d/%d (%.1f%%) %.1f KiB/s peers=%d active=%d pending=%d seeders=%d uploads=%d/%d bufs=%d/%d puts=%d",
 				got, total, pct, rate/1024.0,
 				ts.TotalPeers, ts.ActivePeers, ts.PendingPeers, ts.ConnectedSeeders,
-				len(s.sem), cap(s.sem), s.store.Puts.Load())
+				len(s.sem), cap(s.sem),
+				len(s.bufSem), cap(s.bufSem),
+				s.store.Puts.Load())
 		}
 	}
 }

@@ -23,6 +23,7 @@ type Config struct {
 	LRUSize          int
 	UpSem            int
 	PrefetchDistance int
+	InflightPieces   int
 	Region           string
 
 	DataDir string
@@ -35,6 +36,7 @@ func loadCommon() *Config {
 		LRUSize:          1000,
 		UpSem:            128,
 		PrefetchDistance: 32,
+		InflightPieces:   1000,
 		Region:           "us-east-1",
 	}
 
@@ -74,6 +76,7 @@ func parseFetchArgs(args []string) *Config {
 	fs.StringVar(&c.S3Root, "s3-root", c.S3Root, "S3 key prefix (env SAMOGON_S3_ROOT)")
 	fs.StringVar(&c.Region, "region", c.Region, "S3 region (MinIO ignores it)")
 	fs.IntVar(&c.UpSem, "up-parallel", c.UpSem, "max concurrent PutObject calls")
+	fs.IntVar(&c.InflightPieces, "inflight-pieces", c.InflightPieces, "max pieces holding a buffer in RAM (downloaded but not yet uploaded)")
 	fs.StringVar(&c.DataDir, "data-dir", "", "anacrolix scratch dir (default: mkdtemp under cwd)")
 
 	Throw(fs.Parse(args))
