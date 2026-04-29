@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,10 @@ import (
 // gc walks every .torrent in <root>/torrents/, unions the V1 piece
 // hashes referenced by them, then deletes any blob under
 // <root>/pieces/ whose hash is not in the union.
+//
+// Bucket is the single positional arg (mc-style "/samogon" or just
+// "samogon") — there's no --bucket flag for gc, the whole point of
+// the command is "purge unreferenced state in this bucket".
 
 func parseGcArgs(args []string) *Config {
 	c := loadCommon()
@@ -26,15 +31,20 @@ func parseGcArgs(args []string) *Config {
 	fs.StringVar(&c.AWSKey, "aws-key", c.AWSKey, "S3 access key (env AWS_ACCESS_KEY_ID)")
 	fs.StringVar(&c.AWSSecret, "aws-secret", c.AWSSecret, "S3 secret key (env AWS_SECRET_ACCESS_KEY)")
 	fs.StringVar(&c.S3Endpt, "endpoint", c.S3Endpt, "S3 endpoint URL (env S3_ENDPOINT)")
-	fs.StringVar(&c.S3Bucket, "bucket", c.S3Bucket, "S3 bucket (env S3_BUCKET)")
 	fs.StringVar(&c.S3Root, "s3-root", c.S3Root, "S3 key prefix (env SAMOGON_S3_ROOT)")
 	fs.StringVar(&c.Region, "region", c.Region, "S3 region")
 	fs.IntVar(&c.UpSem, "max-inflight", c.UpSem, "worker count (== max concurrent S3 ops)")
 
 	Throw(fs.Parse(args))
 
-	if fs.NArg() > 0 {
-		ThrowFmt("samogon gc: unexpected positional args: %v", fs.Args())
+	if fs.NArg() != 1 {
+		ThrowFmt("samogon gc: expected one positional arg (bucket, e.g. /samogon)")
+	}
+
+	c.S3Bucket = strings.TrimPrefix(fs.Arg(0), "/")
+
+	if c.S3Bucket == "" {
+		ThrowFmt("samogon gc: empty bucket name")
 	}
 
 	validate(c)
