@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -183,8 +184,12 @@ func (s *Storage) ListStream(prefix string) <-chan string {
 			Prefix: aws.String(prefix),
 		})
 
+		pageNum := 0
+
 		for pager.HasMorePages() {
+			t := time.Now()
 			page, err := pager.NextPage(context.Background())
+			pageNum++
 
 			if err != nil {
 				if isNotFound(err) {
@@ -193,6 +198,10 @@ func (s *Storage) ListStream(prefix string) <-chan string {
 
 				ThrowFmt("s3 ListObjectsV2 %s: %v", prefix, err)
 			}
+
+			fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf(
+				"list %s: page %d, %d items in %s",
+				prefix, pageNum, len(page.Contents), time.Since(t).Round(time.Millisecond))))
 
 			for _, obj := range page.Contents {
 				ch <- aws.ToString(obj.Key)
