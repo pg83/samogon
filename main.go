@@ -49,6 +49,10 @@ Subcommands:
               isolates minio/network from the get pipeline
   bench       PutObject throughput test — N goroutines spam fixed-
               size chunks at the endpoint, reports ops/s + MiB/s
+  repack      stream an existing torrent's pieces through the CAS,
+              re-slice into bigger (or smaller) pieces of
+              --piece-size, write new pieces + new .torrent under
+              its fresh infohash. Source remains intact.
   bot         Telegram bot front-end for fetch — accepts .torrent
               files from an allow-listed set of users and pipes each
               into gorn ignite -- samogon fetch
@@ -102,6 +106,10 @@ func main() {
 		case "bench":
 			cfg, opts := parseBenchArgs(rest)
 			runBench(cfg, opts)
+
+		case "repack":
+			cfg, opts := parseRepackArgs(rest)
+			runRepack(cfg, opts)
 
 		case "bot":
 			runBot(parseBotArgs(rest))
