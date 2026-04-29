@@ -141,6 +141,17 @@ func (s *Storage) PutFile(key, p string) {
 	s.Puts.Add(1)
 }
 
+func (s *Storage) Delete(key string) {
+	_, err := s.cli.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.cfg.S3Bucket),
+		Key:    aws.String(key),
+	})
+
+	if err != nil {
+		ThrowFmt("s3 DeleteObject %s: %v", key, err)
+	}
+}
+
 func (s *Storage) Cat(key string) []byte {
 	out, err := s.cli.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(s.cfg.S3Bucket),

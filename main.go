@@ -53,6 +53,9 @@ Subcommands:
               re-slice into bigger (or smaller) pieces of
               --piece-size, write new pieces + new .torrent under
               its fresh infohash. Source remains intact.
+  gc          drop unreferenced pieces — load every .torrent under
+              <root>/torrents/, union their piece hashes, delete
+              every blob under <root>/pieces/ that's not in the union.
   bot         Telegram bot front-end for fetch — accepts .torrent
               files from an allow-listed set of users and pipes each
               into gorn ignite -- samogon fetch
@@ -110,6 +113,9 @@ func main() {
 		case "repack":
 			cfg, opts := parseRepackArgs(rest)
 			runRepack(cfg, opts)
+
+		case "gc":
+			runGc(parseGcArgs(rest))
 
 		case "bot":
 			runBot(parseBotArgs(rest))
