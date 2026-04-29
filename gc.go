@@ -29,7 +29,7 @@ func parseGcArgs(args []string) *Config {
 	fs.StringVar(&c.S3Bucket, "bucket", c.S3Bucket, "S3 bucket (env S3_BUCKET)")
 	fs.StringVar(&c.S3Root, "s3-root", c.S3Root, "S3 key prefix (env SAMOGON_S3_ROOT)")
 	fs.StringVar(&c.Region, "region", c.Region, "S3 region")
-	fs.IntVar(&c.UpSem, "max-inflight", c.UpSem, "max concurrent S3 ops")
+	fs.IntVar(&c.UpSem, "max-inflight", c.UpSem, "worker count (== max concurrent S3 ops)")
 
 	Throw(fs.Parse(args))
 
@@ -42,11 +42,37 @@ func parseGcArgs(args []string) *Config {
 	return c
 }
 
+// pmap fans out `fn` over `items` across `workers` goroutines pulling
+// from a single channel. Returns when every item has been processed.
+func pmap[T any](items []T, workers int, fn func(T)) {
+	jobs := make(chan T)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for j := range jobs {
+				fn(j)
+			}
+		}()
+	}
+
+	for _, it := range items {
+		jobs <- it
+	}
+
+	close(jobs)
+	wg.Wait()
+}
+
 func runGc(cfg *Config) {
 	store := newStorage(cfg)
 	defer store.Close()
 
-	sem := make(chan struct{}, cfg.UpSem)
 	start := time.Now()
 
 	torrentKeys := store.List(cfg.PrefixTorrents())
@@ -55,41 +81,29 @@ func runGc(cfg *Config) {
 
 	var (
 		alive   sync.Map
-		loadWg  sync.WaitGroup
 		loaded  atomic.Int64
 		skipped atomic.Int64
 	)
 
-	for _, k := range torrentKeys {
-		loadWg.Add(1)
-
-		go func(key string) {
-			defer loadWg.Done()
-
-			sem <- struct{}{}
+	pmap(torrentKeys, cfg.UpSem, func(key string) {
+		exc := Try(func() {
 			raw := store.Cat(key)
-			<-sem
+			mi := Throw2(metainfo.Load(bytes.NewReader(raw)))
+			info := Throw2(mi.UnmarshalInfo())
 
-			exc := Try(func() {
-				mi := Throw2(metainfo.Load(bytes.NewReader(raw)))
-				info := Throw2(mi.UnmarshalInfo())
+			for i := 0; i < info.NumPieces(); i++ {
+				h := info.Piece(i).V1Hash().Unwrap().HexString()
+				alive.Store(h, struct{}{})
+			}
 
-				for i := 0; i < info.NumPieces(); i++ {
-					h := info.Piece(i).V1Hash().Unwrap().HexString()
-					alive.Store(h, struct{}{})
-				}
+			loaded.Add(1)
+		})
 
-				loaded.Add(1)
-			})
-
-			exc.Catch(func(e *Exception) {
-				fmt.Fprintln(os.Stderr, clr(clrY, "gc: skip "+key+": "+e.Error()))
-				skipped.Add(1)
-			})
-		}(k)
-	}
-
-	loadWg.Wait()
+		exc.Catch(func(e *Exception) {
+			fmt.Fprintln(os.Stderr, clr(clrY, "gc: skip "+key+": "+e.Error()))
+			skipped.Add(1)
+		})
+	})
 
 	aliveCount := 0
 	alive.Range(func(_, _ any) bool { aliveCount++; return true })
@@ -101,38 +115,26 @@ func runGc(cfg *Config) {
 
 	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("gc: %d pieces in CAS", len(pieceKeys))))
 
-	var (
-		delWg   sync.WaitGroup
-		deleted atomic.Int64
-		kept    atomic.Int64
-	)
+	stale := pieceKeys[:0]
 
 	for _, k := range pieceKeys {
-		h := path.Base(k)
-
-		if _, ok := alive.Load(h); ok {
-			kept.Add(1)
-
-			continue
+		if _, ok := alive.Load(path.Base(k)); !ok {
+			stale = append(stale, k)
 		}
-
-		delWg.Add(1)
-
-		go func(key string) {
-			defer delWg.Done()
-
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			store.Delete(key)
-			deleted.Add(1)
-		}(k)
 	}
 
-	delWg.Wait()
+	kept := len(pieceKeys) - len(stale)
+	var deleted atomic.Int64
+
+	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("gc: %d kept, %d to delete", kept, len(stale))))
+
+	pmap(stale, cfg.UpSem, func(key string) {
+		store.Delete(key)
+		deleted.Add(1)
+	})
 
 	elapsed := time.Since(start)
 
-	fmt.Fprintln(os.Stderr, clr(clrG, fmt.Sprintf("gc: kept %d, deleted %d in %s",
-		kept.Load(), deleted.Load(), elapsed.Round(time.Millisecond))))
+	fmt.Fprintln(os.Stderr, clr(clrG, fmt.Sprintf("gc: done — kept %d, deleted %d in %s",
+		kept, deleted.Load(), elapsed.Round(time.Millisecond))))
 }
