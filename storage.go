@@ -167,6 +167,42 @@ func (s *Storage) Cat(key string) []byte {
 	return Throw2(io.ReadAll(out.Body))
 }
 
+// ListStream pages through the prefix and pushes each key to the
+// returned channel as it arrives. The caller can start work on early
+// keys while the rest of the listing is still in flight — useful when
+// the prefix has 100k+ objects (e.g. CAS pieces) and waiting for the
+// full slice would block visible progress for minutes.
+func (s *Storage) ListStream(prefix string) <-chan string {
+	ch := make(chan string, 1024)
+
+	go func() {
+		defer close(ch)
+
+		pager := s3.NewListObjectsV2Paginator(s.cli, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.cfg.S3Bucket),
+			Prefix: aws.String(prefix),
+		})
+
+		for pager.HasMorePages() {
+			page, err := pager.NextPage(context.Background())
+
+			if err != nil {
+				if isNotFound(err) {
+					return
+				}
+
+				ThrowFmt("s3 ListObjectsV2 %s: %v", prefix, err)
+			}
+
+			for _, obj := range page.Contents {
+				ch <- aws.ToString(obj.Key)
+			}
+		}
+	}()
+
+	return ch
+}
+
 // List returns the full keys under prefix. A "no such bucket/key"
 // error is treated as an empty listing (same observable state as an
 // empty prefix) — auth and network failures still throw.

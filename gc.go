@@ -121,30 +121,73 @@ func runGc(cfg *Config) {
 	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("gc: loaded %d torrents (%d skipped), %d unique alive pieces",
 		loaded.Load(), skipped.Load(), aliveCount)))
 
-	pieceKeys := store.List(cfg.PrefixPieces())
+	// Streaming sweep: List paginates from S3 in the background while
+	// the worker pool consumes stale keys directly. Without streaming
+	// we'd block on List for several minutes on 100k+ pieces with no
+	// visible progress.
+	fmt.Fprintln(os.Stderr, clr(clrB, "gc: streaming pieces, deleting unreferenced..."))
 
-	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("gc: %d pieces in CAS", len(pieceKeys))))
+	pieceCh := store.ListStream(cfg.PrefixPieces())
+	stale := make(chan string, cfg.UpSem*2)
 
-	stale := pieceKeys[:0]
+	var (
+		scanned atomic.Int64
+		kept    atomic.Int64
+		deleted atomic.Int64
+		workers sync.WaitGroup
+	)
 
-	for _, k := range pieceKeys {
-		if _, ok := alive.Load(path.Base(k)); !ok {
-			stale = append(stale, k)
-		}
+	for i := 0; i < cfg.UpSem; i++ {
+		workers.Add(1)
+
+		go func() {
+			defer workers.Done()
+
+			for k := range stale {
+				store.Delete(k)
+				deleted.Add(1)
+			}
+		}()
 	}
 
-	kept := len(pieceKeys) - len(stale)
-	var deleted atomic.Int64
+	progressDone := make(chan struct{})
 
-	fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("gc: %d kept, %d to delete", kept, len(stale))))
+	go gcProgress(&scanned, &kept, &deleted, progressDone)
 
-	pmap(stale, cfg.UpSem, func(key string) {
-		store.Delete(key)
-		deleted.Add(1)
-	})
+	for k := range pieceCh {
+		scanned.Add(1)
+
+		if _, ok := alive.Load(path.Base(k)); ok {
+			kept.Add(1)
+
+			continue
+		}
+
+		stale <- k
+	}
+
+	close(stale)
+	workers.Wait()
+	close(progressDone)
 
 	elapsed := time.Since(start)
 
-	fmt.Fprintln(os.Stderr, clr(clrG, fmt.Sprintf("gc: done — kept %d, deleted %d in %s",
-		kept, deleted.Load(), elapsed.Round(time.Millisecond))))
+	fmt.Fprintln(os.Stderr, clr(clrG, fmt.Sprintf("gc: done — scanned %d, kept %d, deleted %d in %s",
+		scanned.Load(), kept.Load(), deleted.Load(), elapsed.Round(time.Millisecond))))
+}
+
+func gcProgress(scanned, kept, deleted *atomic.Int64, done <-chan struct{}) {
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+
+		case <-tick.C:
+			fmt.Fprintln(os.Stderr, clr(clrB, fmt.Sprintf("gc: scanned %d, kept %d, deleted %d",
+				scanned.Load(), kept.Load(), deleted.Load())))
+		}
+	}
 }
