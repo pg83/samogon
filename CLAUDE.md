@@ -7,6 +7,10 @@ Torrent→S3 bridge. Two subcommands share one binary:
 
 Seeding is **not** implemented. The anacrolix storage `ReadAt` path is a stub.
 
+## Coding conventions
+
+- Git author: `claude <claude@users.noreply.github.com>`. Commit messages in English.
+
 ## Architecture
 
 ```
