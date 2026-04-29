@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +53,7 @@ func parseRepackArgs(args []string) (*Config, repackOpts) {
 	fs.StringVar(&c.Region, "region", c.Region, "S3 region")
 	fs.IntVar(&c.LRUSize, "lru", c.LRUSize, "piece cache size (entries)")
 	fs.IntVar(&c.PrefetchDistance, "prefetch-distance", c.PrefetchDistance, "old pieces to readahead while streaming (0 disables)")
+	fs.IntVar(&c.UpSem, "max-inflight", c.UpSem, "max concurrent S3 ops (Cat/Stat/PutBytes combined)")
 
 	opts := repackOpts{}
 
@@ -121,12 +123,20 @@ func runRepack(cfg *Config, opts repackOpts) {
 		"repack: target pieceLen=%d (= %.2f MiB)",
 		opts.pieceSize, float64(opts.pieceSize)/(1024*1024))))
 
+	// One semaphore caps every S3 op the repack issues — foreground &
+	// prefetch GETs in pieceStream, plus the background Stat+Put pair
+	// per emitted piece. Anything that touches the network goes through
+	// this so a slow link or backed-up minio can't fan out into
+	// thousands of in-flight requests.
+	sem := make(chan struct{}, cfg.UpSem)
+
 	src := &pieceStream{
 		hashes: tm.PieceHashes,
 		cfg:    cfg,
 		store:  store,
 		cache:  cache,
 		group:  &singleflight.Group{},
+		sem:    sem,
 	}
 
 	buf := make([]byte, opts.pieceSize)
@@ -135,8 +145,9 @@ func runRepack(cfg *Config, opts repackOpts) {
 	var (
 		pieceCount int
 		bytesRead  atomic.Int64
-		newPuts    int
-		skipPuts   int
+		newPuts    atomic.Int64
+		skipPuts   atomic.Int64
+		putWg      sync.WaitGroup
 	)
 
 	start := time.Now()
@@ -148,17 +159,27 @@ func runRepack(cfg *Config, opts repackOpts) {
 		n, err := io.ReadFull(src, buf)
 
 		if n > 0 {
-			chunk := buf[:n]
+			chunk := append([]byte(nil), buf[:n]...) // copy: buf reused next iter
 			h := sha1.Sum(chunk)
 			hashHex := hex.EncodeToString(h[:])
 			key := cfg.KeyPiece(hashHex)
 
-			if store.Stat(key) {
-				skipPuts++
-			} else {
+			putWg.Add(1)
+			go func() {
+				defer putWg.Done()
+
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				if store.Stat(key) {
+					skipPuts.Add(1)
+
+					return
+				}
+
 				store.PutBytes(key, chunk)
-				newPuts++
-			}
+				newPuts.Add(1)
+			}()
 
 			newPieces = append(newPieces, h[:]...)
 			pieceCount++
@@ -176,6 +197,11 @@ func runRepack(cfg *Config, opts repackOpts) {
 
 	close(done)
 
+	// Drain in-flight uploads before bencoding the new .torrent — we
+	// need every new piece committed to S3 before publishing the
+	// metainfo that points at them.
+	putWg.Wait()
+
 	if bytesRead.Load() != info.TotalLength() {
 		ThrowFmt("repack: streamed %d bytes but expected %d", bytesRead.Load(), info.TotalLength())
 	}
@@ -186,7 +212,7 @@ func runRepack(cfg *Config, opts repackOpts) {
 		"repack: streamed %d bytes into %d new pieces in %s (%.2f MiB/s); %d new puts, %d skipped (already in CAS)",
 		bytesRead.Load(), pieceCount, elapsed.Round(time.Millisecond),
 		float64(bytesRead.Load())/elapsed.Seconds()/(1024*1024),
-		newPuts, skipPuts)))
+		newPuts.Load(), skipPuts.Load())))
 
 	// Rebuild info with new piece layout. PieceLength + Pieces are the
 	// only fields that change; Name, Files, Private, etc. preserved.
@@ -227,6 +253,7 @@ type pieceStream struct {
 	store  *Storage
 	cache  *LRU
 	group  *singleflight.Group
+	sem    chan struct{} // shared S3-op semaphore; gates every Cat
 
 	cur int    // index of current piece
 	pos int    // byte offset within current piece
@@ -280,7 +307,7 @@ func (s *pieceStream) fetch(idx int) []byte {
 				}
 
 				_ = Try(func() {
-					s.cache.Put(hash, s.store.Cat(s.cfg.KeyPiece(hash)))
+					s.catUnderSem(hash)
 				})
 
 				return nil, nil
@@ -299,7 +326,7 @@ func (s *pieceStream) fetch(idx int) []byte {
 			return nil, nil
 		}
 
-		s.cache.Put(hash, s.store.Cat(s.cfg.KeyPiece(hash)))
+		s.catUnderSem(hash)
 
 		return nil, nil
 	})
@@ -311,6 +338,16 @@ func (s *pieceStream) fetch(idx int) []byte {
 	}
 
 	return data
+}
+
+// catUnderSem performs the S3 GET under the shared semaphore and
+// stuffs the result in the LRU. Caller is the singleflight leader for
+// this hash, so the cache.Put can't race with another fetch path.
+func (s *pieceStream) catUnderSem(hash string) {
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+
+	s.cache.Put(hash, s.store.Cat(s.cfg.KeyPiece(hash)))
 }
 
 func repackReporter(bytesRead *atomic.Int64, total int64, start time.Time, done <-chan struct{}) {
