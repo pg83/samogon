@@ -264,7 +264,11 @@ func (s *pieceStream) Read(p []byte) (int, error) {
 }
 
 // fetch grabs piece `idx` through cache + singleflight. Same pattern
-// as virtualFile.getPiece, with prefetch firing for `idx + PrefetchDistance`.
+// as virtualFile.getPiece: the lambda is pure side-effect (Put into
+// the cache), the caller always reads back via cache.Get afterwards.
+// That avoids a race where a prefetch and a foreground fetch collide
+// on the same hash — singleflight collapses them onto one Do() call,
+// and whichever lambda runs has the same cache-warming behaviour.
 func (s *pieceStream) fetch(idx int) []byte {
 	if d := s.cfg.PrefetchDistance; d > 0 && idx+d < len(s.hashes) {
 		hash := s.hashes[idx+d]
@@ -290,18 +294,23 @@ func (s *pieceStream) fetch(idx int) []byte {
 		return data
 	}
 
-	v, _, _ := s.group.Do(hash, func() (any, error) {
-		if data, ok := s.cache.Get(hash); ok {
-			return data, nil
+	_, _, _ = s.group.Do(hash, func() (any, error) {
+		if _, ok := s.cache.Get(hash); ok {
+			return nil, nil
 		}
 
-		data := s.store.Cat(s.cfg.KeyPiece(hash))
-		s.cache.Put(hash, data)
+		s.cache.Put(hash, s.store.Cat(s.cfg.KeyPiece(hash)))
 
-		return data, nil
+		return nil, nil
 	})
 
-	return v.([]byte)
+	data, ok := s.cache.Get(hash)
+
+	if !ok {
+		ThrowFmt("repack: piece %s missing from cache after fetch (LRU evicted under contention?)", hash)
+	}
+
+	return data
 }
 
 func repackReporter(bytesRead *atomic.Int64, total int64, start time.Time, done <-chan struct{}) {
